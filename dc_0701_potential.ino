@@ -3,7 +3,7 @@
 // 목적: 손으로 모터를 돌렸을 때 A0 가변저항 값 확인
 // =====================================================
 
-const uint8_t DC_POT_PIN = A0;
+const uint8_t DC_POT_PIN = A2;
 
 int measured_min = 1023;
 int measured_max = 0;
