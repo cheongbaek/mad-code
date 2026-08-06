@@ -93,7 +93,7 @@ void loop()
   {
     lastPrint = millis();
 
-    Serial.print(motorSpeed);
+    Serial.print(motorSpeed / 10);  // 정밀 RPM 불필요, 회전 여부 확인 용도라 한 자릿수 잘라서 전송
     Serial.print(',');
     Serial.print(battVoltage, 1);
     Serial.print(',');

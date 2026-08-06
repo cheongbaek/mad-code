@@ -1,129 +1,669 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-#  ksae_can.py  -  ksae_can.ino가 보내는 CAN 텔레메트리 수신 -> CSV 기록
-#  - ksae_can.ino가 CAN(EZkontrol)에서 필요한 필드만 뽑아 시리얼로 보내면
-#    이 스크립트가 받아서 CSV로 저장 (ksae_canlogging.ino의 SD 로깅 대체)
-#  - 시리얼 라인 형식 : <speed_rpm>,<batt_v>,<batt_a>,<phase_a>,<gear>
+#  y_can.py  -  y_can.ino가 보내는 CAN 텔레메트리 GUI 대시보드 / 기록 / 시각화
+#
+#  - y_can.ino가 CAN(EZkontrol)에서 필요한 필드만 뽑아 시리얼로 보내면
+#    이 스크립트가 받아서 실시간 표시 + CSV 기록 + matplotlib 시각화를 한다.
+#    (ksae_canlogging.ino의 SD 로깅 역할을 PC측으로 옮긴 것)
+#
+#  - 시리얼 라인 형식 : <speed_div10>,<batt_v>,<batt_a>,<phase_a>,<gear>
+#    ★ 첫 필드는 rpm을 10으로 나눈 정수 절사값이다. 실제 rpm = 값 x 10 ★
+#    '#'로 시작하는 줄은 아두이노의 경고 메시지이므로 건너뛴다.
+#
+#  - Windows + 아두이노 메가 1대 연결 전제. 포트는 자동으로 찾아 붙고,
+#    실행 중 끊겨도 RECONNECT_INTERVAL_S(3초)마다 재연결을 시도한다.
+#    아두이노가 없는 상태로 실행해도 GUI는 정상 동작한다.
 # ============================================================
 
-import argparse
+import collections
 import csv
-import sys
+import os
+import queue
+import re
+import threading
 import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 import serial
 from serial.tools import list_ports
 
+
+# ====================== 설정값 ======================
+
+# ---- 배터리 스펙 (배터리 퍼센트 환산 기준) ----
+# ★★ 반드시 실제 팩 스펙으로 검증할 것 ★★
+# 아래는 "정격 58V = 16S 리튬이온"으로 가정한 값이다(16 x 3.6V = 57.6V).
+# 팩이 다르면(예: LiFePO4 16S면 만충 58.4V / 방전종지 40V) 이 두 값만 고치면 된다.
+BATT_V_FULL  = 67.2   # 만충전 전압 (16 x 4.20V)
+BATT_V_EMPTY = 48.0   # 방전종지 전압 (16 x 3.00V)
+
+# ---- 시리얼 ----
+BAUD                  = 115200
+SERIAL_TIMEOUT_S      = 1.0    # readline 타임아웃
+RECONNECT_INTERVAL_S  = 3.0    # 연결 실패/끊김 시 재시도 간격
+DATA_WATCHDOG_S       = 5.0    # 이 시간 동안 유효 데이터가 없으면 끊긴 것으로 보고 재연결
+
+# ---- 기록 ----
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))  # csvdata_NNN 폴더가 생기는 위치
+FOLDER_PREFIX = "csvdata_"
+CSV_NAME      = "canlog.csv"
+SUMMARY_NAME  = "summary.txt"
+
+CSV_HEADER = ["t_s", "host_time", "speed_div10", "rpm",
+              "batt_v", "batt_a", "phase_a", "gear",
+              "power_w", "energy_wh", "batt_pct"]
+
+# ---- UI ----
+TICK_MS       = 100   # 큐 배출 + 화면 갱신 주기
+PCT_SMOOTH_N  = 20    # 배터리% 표시용 이동평균 표본수 (2초). CSV에는 원시값이 들어간다
+DT_SANITY_MAX = 1.0   # 이보다 긴 간격은 통신 끊김으로 보고 전력량 적분에서 제외
+
 GEAR_NAMES = {0: "NO", 1: "R", 2: "N", 3: "D1", 4: "D2", 5: "D3", 6: "S", 7: "P"}
 
-# ---------------------- 포트 자동 탐지 (kasa_example_control.py와 동일 방식) ----------------------
+
+# ====================== 포트 자동 탐지 ======================
+
 KNOWN_MEGA_VIDPID = {(0x2341, 0x0042), (0x2341, 0x0010), (0x2341, 0x003F), (0x2A03, 0x0042)}
-CANDIDATE_VIDS = {0x1A86, 0x0403, 0x10C4}
+CANDIDATE_VIDS = {0x1A86, 0x0403, 0x10C4, 0x2341, 0x2A03}  # CH340 / FTDI / CP210x / Arduino
 
 
-def find_mega_port():
-    ports = list(list_ports.comports())
-    for p in ports:
-        if p.vid is not None and p.pid is not None and (p.vid, p.pid) in KNOWN_MEGA_VIDPID:
-            return p.device, f"Arduino Mega 확정 ({p.description})"
-    for p in ports:
+def find_arduino_port():
+    """아두이노로 보이는 COM 포트를 점수순으로 1개 골라 반환. 없으면 None.
+
+    '아두이노면 닥치고 연결' 전제라 사용자에게 묻지 않는다. 다만 블루투스
+    가상 COM 포트는 아두이노와 무관하게 흔히 잡히므로 후보에서 제외한다.
+    """
+    best, best_score = None, 0
+    for p in list_ports.comports():
         desc = (p.description or "").lower()
-        if "mega" in desc or "arduino" in desc:
-            return p.device, f"이름 매칭 ({p.description})"
-    candidates = [p for p in ports if p.vid in CANDIDATE_VIDS]
-    if len(candidates) == 1:
-        p = candidates[0]
-        return p.device, f"호환 칩 후보 1개 자동선택 ({p.description})"
-    return None, None
+        hwid = (p.hwid or "").lower()
+        if "bluetooth" in desc or "bluetooth" in hwid:
+            continue
+
+        if p.vid is not None and (p.vid, p.pid) in KNOWN_MEGA_VIDPID:
+            score = 100
+        elif "mega" in desc:
+            score = 90
+        elif "arduino" in desc:
+            score = 80
+        elif p.vid in CANDIDATE_VIDS:
+            score = 70
+        elif "usb-serial" in desc or "usb serial" in desc:
+            score = 50
+        else:
+            score = 0
+
+        if score > best_score:
+            best, best_score = p, score
+    return best.device if best else None
 
 
-def list_all_ports():
-    ports = list(list_ports.comports())
-    if not ports:
-        print("  사용 가능한 시리얼 포트가 없습니다.")
-        return []
-    print("  사용 가능한 포트:")
-    for i, p in enumerate(ports):
-        vid = f"{p.vid:04X}" if p.vid else "----"
-        pid = f"{p.pid:04X}" if p.pid else "----"
-        print(f"   [{i}] {p.device}  (VID:{vid} PID:{pid})  {p.description}")
-    return ports
-
-
-def resolve_port():
-    port, reason = find_mega_port()
-    if port:
-        print(f"[포트] 자동 감지: {port}  ({reason})")
-        return port
-    print("[포트] 자동 감지 실패. 수동으로 선택하세요.")
-    ports = list_all_ports()
-    if not ports:
-        return None
-    sel = input("  포트 번호 선택 (그 외 입력=취소) > ").strip()
-    if sel.isdigit() and 0 <= int(sel) < len(ports):
-        return ports[int(sel)].device
-    return None
-
-
-# ---------------------- 라인 파싱 ----------------------
 def parse_line(line):
-    parts = line.strip().split(",")
+    """'654,58.3,12.5,45.2,3' -> (speed_div10, batt_v, batt_a, phase_a, gear)"""
+    parts = line.split(",")
     if len(parts) != 5:
         return None
     try:
-        speed = int(parts[0])
-        batt_v = float(parts[1])
-        batt_a = float(parts[2])
-        phase_a = float(parts[3])
-        gear = int(parts[4])
+        return (int(parts[0]), float(parts[1]), float(parts[2]),
+                float(parts[3]), int(parts[4]))
     except ValueError:
         return None
-    return speed, batt_v, batt_a, phase_a, gear
 
 
-# ---------------------- 메인 ----------------------
-def main():
-    ap = argparse.ArgumentParser(description="ksae_can.ino 시리얼 텔레메트리 수신 -> CSV 기록")
-    ap.add_argument("--port", default=None, help="예: /dev/ttyACM0 또는 COM3 (생략 시 자동 탐지)")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--out", default="ksae_can_log.csv")
-    args = ap.parse_args()
+def batt_pct(v):
+    """전압 -> 배터리 잔량(%). 부하 중엔 전압강하로 실제보다 낮게 나오는 근사치다."""
+    if BATT_V_FULL <= BATT_V_EMPTY:
+        return 0.0
+    pct = (v - BATT_V_EMPTY) / (BATT_V_FULL - BATT_V_EMPTY) * 100.0
+    return max(0.0, min(100.0, pct))
 
-    port = args.port or resolve_port()
-    if port is None:
-        print("연결할 포트를 결정하지 못했습니다. 종료합니다.")
-        return
 
+# ====================== 시리얼 수신 스레드 ======================
+
+class SerialWorker(threading.Thread):
+    """백그라운드로 시리얼을 읽어 큐에 넣는다. 연결 실패/끊김은 스스로 재시도한다."""
+
+    def __init__(self, data_q, status_q):
+        super().__init__(daemon=True)
+        self.data_q = data_q
+        self.status_q = status_q
+        self._stop_evt = threading.Event()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _status(self, text):
+        self.status_q.put(text)
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            port = find_arduino_port()
+            if port is None:
+                self._status("아두이노 탐색 중... (연결되지 않음)")
+                self._stop_evt.wait(RECONNECT_INTERVAL_S)
+                continue
+
+            try:
+                ser = serial.Serial(port, BAUD, timeout=SERIAL_TIMEOUT_S)
+            except Exception as e:
+                self._status(f"{port} 연결 실패 ({e.__class__.__name__}) - {RECONNECT_INTERVAL_S:.0f}초 후 재시도")
+                self._stop_evt.wait(RECONNECT_INTERVAL_S)
+                continue
+
+            self._status(f"{port} 연결됨 - 데이터 대기 중")
+            last_data = time.monotonic()
+            try:
+                ser.reset_input_buffer()
+                while not self._stop_evt.is_set():
+                    raw = ser.readline()
+                    now = time.monotonic()
+                    if raw:
+                        line = raw.decode("ascii", errors="ignore").strip()
+                        # '#' 줄은 아두이노쪽 경고(MCP2515 초기화 실패 등)
+                        if line and not line.startswith("#"):
+                            sample = parse_line(line)
+                            if sample is not None:
+                                if now - last_data > 1.0:
+                                    self._status(f"{port} 수신 중")
+                                last_data = now
+                                self.data_q.put(sample)
+                    # USB가 뽑혀도 예외 없이 타임아웃만 반복되는 경우가 있어 워치독을 둔다
+                    if now - last_data > DATA_WATCHDOG_S:
+                        self._status(f"{port} 무응답 {DATA_WATCHDOG_S:.0f}초 - 재연결")
+                        break
+            except Exception:
+                self._status(f"{port} 연결 끊김 - {RECONNECT_INTERVAL_S:.0f}초 후 재연결")
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+            if not self._stop_evt.is_set():
+                self._stop_evt.wait(RECONNECT_INTERVAL_S)
+
+
+# ====================== 기록 ======================
+
+def next_folder_path(base_dir):
+    """csvdata_001 ... csvdata_999 -> csvdata_000 -> csvdata_001(덮어쓰기) 순환."""
+    pat = re.compile(r"^" + re.escape(FOLDER_PREFIX) + r"(\d{3})$")
+    found = []
     try:
-        ser = serial.Serial(port, args.baud, timeout=1)
-    except serial.SerialException as e:
-        print(f"시리얼 연결 실패: {e}")
-        return
+        for name in os.listdir(base_dir):
+            m = pat.match(name)
+            full = os.path.join(base_dir, name)
+            if m and os.path.isdir(full):
+                found.append((os.path.getmtime(full), int(m.group(1))))
+    except OSError:
+        pass
 
-    with open(args.out, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["host_time", "speed_rpm", "batt_v", "batt_a", "phase_a", "gear"])
+    if not found:
+        n = 1
+    else:
+        found.sort()                      # 번호가 순환하므로 '가장 최근에 쓴 폴더' 기준으로 잇는다
+        n = (found[-1][1] + 1) % 1000
+    return os.path.join(base_dir, f"{FOLDER_PREFIX}{n:03d}")
 
-        print(f"[{port}] 수신 시작 -> {args.out} 에 기록 (Ctrl+C로 종료)")
+
+class Recorder:
+    """CSV 기록 + 누적 연산(전력량 등)을 함께 담당."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        os.makedirs(folder, exist_ok=True)
+        self.csv_path = os.path.join(folder, CSV_NAME)
+        self._f = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self._w = csv.writer(self._f)
+        self._w.writerow(CSV_HEADER)
+
+        self.t0 = time.monotonic()
+        self.wall_start = time.time()
+        self._last_t = None
+
+        self.n = 0
+        self.energy_wh = 0.0       # 순 소비량 (회생분이 차감된 값)
+        self.discharge_wh = 0.0
+        self.regen_wh = 0.0
+        self.start_v = None
+        self.last_v = None
+        self.start_pct = None
+        self.last_pct = None
+        self.peak_rpm = 0
+        self.peak_phase_a = 0.0
+        self.peak_batt_a = 0.0
+
+    def add(self, speed_div10, batt_v, batt_a, phase_a, gear):
+        now = time.monotonic()
+        t = now - self.t0
+        dt = 0.0 if self._last_t is None else (now - self._last_t)
+        if dt > DT_SANITY_MAX:     # 끊겼다 붙은 구간을 전력량에 통째로 넣지 않는다
+            dt = 0.0
+        self._last_t = now
+
+        rpm = speed_div10 * 10
+        power_w = batt_v * batt_a          # 전력량은 버스(배터리) 전류 기준. 상전류로는 계산 불가
+        wh = power_w * dt / 3600.0
+        self.energy_wh += wh
+        if wh >= 0.0:
+            self.discharge_wh += wh
+        else:
+            self.regen_wh += -wh
+
+        pct = batt_pct(batt_v)
+
+        self.n += 1
+        if self.start_v is None:
+            self.start_v, self.start_pct = batt_v, pct
+        self.last_v, self.last_pct = batt_v, pct
+        self.peak_rpm = max(self.peak_rpm, rpm)
+        self.peak_phase_a = max(self.peak_phase_a, abs(phase_a))
+        self.peak_batt_a = max(self.peak_batt_a, abs(batt_a))
+
+        self._w.writerow([f"{t:.3f}", f"{time.time():.3f}", speed_div10, rpm,
+                          f"{batt_v:.1f}", f"{batt_a:.1f}", f"{phase_a:.1f}", gear,
+                          f"{power_w:.1f}", f"{self.energy_wh:.4f}", f"{pct:.2f}"])
+        self._f.flush()   # 전원이 갑자기 끊겨도 마지막 줄까지 남도록 (SD 로거와 같은 이유)
+
+    def elapsed(self):
+        return time.monotonic() - self.t0
+
+    def close(self):
         try:
-            while True:
-                raw = ser.readline().decode("ascii", errors="ignore")
-                if not raw:
-                    continue
-                parsed = parse_line(raw)
-                if parsed is None:
-                    continue
-                speed, batt_v, batt_a, phase_a, gear = parsed
+            self._f.close()
+        except Exception:
+            pass
+        self._write_summary()
 
-                writer.writerow([time.time(), speed, batt_v, batt_a, phase_a, gear])
-                f.flush()
+    def _write_summary(self):
+        dur = self.elapsed()
+        lines = [
+            "y_can 기록 요약",
+            "=" * 46,
+            f"폴더        : {os.path.basename(self.folder)}",
+            f"시작        : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.wall_start))}",
+            f"기록 시간   : {dur:.1f} 초",
+            f"샘플 수     : {self.n}",
+            "",
+            "--- 배터리 ---",
+            f"시작 전압   : {self.start_v if self.start_v is None else round(self.start_v, 1)} V",
+            f"종료 전압   : {self.last_v if self.last_v is None else round(self.last_v, 1)} V",
+            f"시작 잔량   : {self.start_pct if self.start_pct is None else round(self.start_pct, 1)} %",
+            f"종료 잔량   : {self.last_pct if self.last_pct is None else round(self.last_pct, 1)} %",
+            f"(환산 기준  : 만충 {BATT_V_FULL} V / 방전종지 {BATT_V_EMPTY} V)",
+            "",
+            "--- 전력량 (배터리전압 x 버스전류 적분) ---",
+            f"총 사용량   : {self.energy_wh:.2f} Wh",
+            f"  방전      : {self.discharge_wh:.2f} Wh",
+            f"  회생      : {self.regen_wh:.2f} Wh",
+            "",
+            "--- 피크 ---",
+            f"최대 RPM    : {self.peak_rpm}",
+            f"최대 상전류 : {self.peak_phase_a:.1f} A",
+            f"최대 버스전류: {self.peak_batt_a:.1f} A",
+        ]
+        try:
+            with open(os.path.join(self.folder, SUMMARY_NAME), "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
 
-                print(f"speed={speed:5d} rpm  battV={batt_v:5.1f} V  battA={batt_a:6.1f} A  "
-                      f"phaseA={phase_a:6.1f} A  gear={GEAR_NAMES.get(gear, '?')}")
-        except KeyboardInterrupt:
-            print("\n중단됨.")
-        finally:
-            ser.close()
+
+# ====================== 저장된 폴더 읽기 ======================
+
+def resolve_data_folder(path):
+    """사용자가 고른 폴더가 csvdata_NNN 자신이 아니라 그 상위일 수도 있어 둘 다 받아준다."""
+    if not path or not os.path.isdir(path):
+        return None
+    if os.path.isfile(os.path.join(path, CSV_NAME)):
+        return path
+    pat = re.compile(r"^" + re.escape(FOLDER_PREFIX) + r"\d{3}$")
+    subs = [os.path.join(path, n) for n in os.listdir(path)
+            if pat.match(n) and os.path.isfile(os.path.join(path, n, CSV_NAME))]
+    if not subs:
+        return None
+    subs.sort(key=os.path.getmtime)
+    return subs[-1]
+
+
+def load_csv(folder):
+    """CSV를 읽어 dict 리스트로. 값은 전부 숫자라 float으로 변환한다."""
+    path = os.path.join(folder, CSV_NAME)
+    if not os.path.isfile(path):
+        return []
+    rows = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    rows.append({k: float(v) for k, v in r.items() if v is not None})
+                except (ValueError, TypeError):
+                    continue   # 기록 중 전원이 끊겨 잘린 마지막 줄 등
+    except OSError:
+        return []
+    return rows
+
+
+def summarize_rows(rows):
+    """저장된 CSV로부터 [1] 배터리% / [2] 총 사용 전력량을 복원."""
+    if not rows:
+        return None
+    last = rows[-1]
+    return {
+        "pct": last.get("batt_pct"),
+        "energy_wh": last.get("energy_wh"),
+        "duration": last.get("t_s"),
+        "n": len(rows),
+    }
+
+
+# ====================== GUI ======================
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("y_can - CAN 텔레메트리 대시보드")
+        root.geometry("940x430")
+        root.minsize(820, 400)
+
+        self.data_q = queue.Queue()
+        self.status_q = queue.Queue()
+        self.worker = SerialWorker(self.data_q, self.status_q)
+
+        self.recorder = None          # 기록 중이면 Recorder 인스턴스
+        self.record_folder = None     # 이번 세션에서 기록한(하는) 폴더
+        self.loaded_folder = None     # 시작할 때 불러온 이전 데이터 폴더
+        self.pct_buf = collections.deque(maxlen=PCT_SMOOTH_N)
+
+        self._build_ui()
+        self.worker.start()
+        root.protocol("WM_DELETE_WINDOW", self.on_quit)
+        root.after(TICK_MS, self._tick)
+        root.after(250, self._startup_folder_prompt)   # 창이 그려진 뒤에 띄운다
+
+    # ---------- UI 구성 ----------
+
+    def _build_ui(self):
+        pad = 10
+        head_font = ("Malgun Gothic", 12, "bold")
+
+        ttk.Label(self.root, text="실시간 대시보드", font=head_font).pack(anchor="w", padx=pad, pady=(pad, 2))
+        dash = ttk.Frame(self.root)
+        dash.pack(fill=tk.X, padx=pad)
+        self.v_speed = self._cell(dash, 0, "모터속도", "rpm")
+        self.v_volt  = self._cell(dash, 1, "배터리 전압", "V")
+        self.v_amp   = self._cell(dash, 2, "배터리 전류", "A")
+        self.v_phase = self._cell(dash, 3, "상전류", "A")
+
+        ttk.Label(self.root, text="상태", font=head_font).pack(anchor="w", padx=pad, pady=(pad, 2))
+        stat = ttk.Frame(self.root)
+        stat.pack(fill=tk.X, padx=pad)
+        self.v_pct    = self._cell(stat, 0, "[1] 배터리 잔량", "%")
+        self.v_energy = self._cell(stat, 1, "[2] 총 사용 전력량", "Wh")
+        self.v_slot3  = self._cell(stat, 2, "[3]", "")
+        self.v_slot4  = self._cell(stat, 3, "[4]", "")
+
+        btns = ttk.Frame(self.root)
+        btns.pack(fill=tk.X, padx=pad, pady=(pad + 4, 4))
+        self.btn_rec = ttk.Button(btns, text="기록 시작", width=18, command=self.on_toggle_record)
+        self.btn_rec.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="시각화", width=14, command=self.on_visualize).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="프로그램 종료", width=14, command=self.on_quit).pack(side=tk.LEFT, padx=6)
+
+        self.conn_status = tk.StringVar(value="아두이노 탐색 중...")
+        self.rec_status = tk.StringVar(value="대기 중")
+        bar = ttk.Frame(self.root)
+        bar.pack(fill=tk.X, side=tk.BOTTOM, padx=pad, pady=(0, 6))
+        ttk.Label(bar, textvariable=self.conn_status, foreground="#555").pack(side=tk.LEFT)
+        ttk.Label(bar, textvariable=self.rec_status, foreground="#555").pack(side=tk.RIGHT)
+
+    def _cell(self, parent, col, title, unit):
+        var = tk.StringVar(value="—")
+        text = f"{title} ({unit})" if unit else title
+        box = ttk.LabelFrame(parent, text=text)
+        box.grid(row=0, column=col, padx=4, pady=2, sticky="nsew")
+        parent.columnconfigure(col, weight=1, uniform="cells")
+        ttk.Label(box, textvariable=var, font=("Consolas", 19, "bold"),
+                  anchor="center").pack(fill=tk.BOTH, expand=True, padx=6, pady=8)
+        return var
+
+    # ---------- 시작 시 이전 폴더 불러오기 ----------
+
+    def _startup_folder_prompt(self):
+        path = filedialog.askdirectory(
+            title="이전 데이터 폴더 선택 (취소하면 비운 채로 시작)",
+            initialdir=BASE_DIR)
+        if not path:
+            self.rec_status.set("대기 중 (이전 데이터 없음)")
+            return
+
+        folder = resolve_data_folder(path)
+        if folder is None:
+            messagebox.showwarning("불러오기", f"{CSV_NAME} 이 없는 폴더입니다.\n비운 채로 시작합니다.")
+            return
+
+        summary = summarize_rows(load_csv(folder))
+        if summary is None:
+            messagebox.showwarning("불러오기", "기록이 비어 있는 폴더입니다.")
+            return
+
+        self.loaded_folder = folder
+        self._show_summary(summary)
+        self.rec_status.set(f"불러옴: {os.path.basename(folder)} ({summary['n']}샘플)")
+
+    def _show_summary(self, s):
+        self.v_pct.set("—" if s["pct"] is None else f"{s['pct']:.1f}")
+        self.v_energy.set("—" if s["energy_wh"] is None else f"{s['energy_wh']:.1f}")
+
+    # ---------- 주기 갱신 ----------
+
+    def _tick(self):
+        while True:
+            try:
+                self.conn_status.set(self.status_q.get_nowait())
+            except queue.Empty:
+                break
+
+        latest = None
+        while True:
+            try:
+                sample = self.data_q.get_nowait()
+            except queue.Empty:
+                break
+            latest = sample
+            if self.recorder is not None:
+                self.recorder.add(*sample)
+
+        if latest is not None:
+            self._update_dashboard(latest)
+
+        if self.recorder is not None:
+            self._update_live_status()
+
+        self.root.after(TICK_MS, self._tick)
+
+    def _update_dashboard(self, sample):
+        speed_div10, batt_v, batt_a, phase_a, gear = sample
+        self.v_speed.set(f"{speed_div10 * 10}")     # 아두이노가 10으로 나눠 보내므로 되돌린다
+        self.v_volt.set(f"{batt_v:.1f}")
+        self.v_amp.set(f"{batt_a:.1f}")
+        self.v_phase.set(f"{phase_a:.1f}")
+        self.pct_buf.append(batt_pct(batt_v))
+
+    def _update_live_status(self):
+        if self.pct_buf:
+            self.v_pct.set(f"{sum(self.pct_buf) / len(self.pct_buf):.1f}")
+        self.v_energy.set(f"{self.recorder.energy_wh:.1f}")
+        self.rec_status.set(f"● 기록 중 {os.path.basename(self.record_folder)} "
+                            f"| {self.recorder.elapsed():.0f}초 | {self.recorder.n}샘플")
+
+    # ---------- 버튼 ----------
+
+    def on_toggle_record(self):
+        if self.recorder is None:
+            self._start_record()
+        else:
+            self._stop_record()
+
+    def _start_record(self):
+        folder = next_folder_path(BASE_DIR)
+        try:
+            recorder = Recorder(folder)
+        except OSError as e:
+            messagebox.showerror("기록 시작 실패", f"{folder}\n{e}")
+            return
+
+        self.recorder = recorder
+        self.record_folder = folder
+        self.pct_buf.clear()
+
+        # 이전에 불러와 띄워둔 값은 지운다 (디스크의 데이터는 그대로 남는다)
+        self.v_pct.set("—")
+        self.v_energy.set("—")
+
+        self.btn_rec.config(text="기록 중지")
+        self.rec_status.set(f"● 기록 중 {os.path.basename(folder)}")
+
+    def _stop_record(self):
+        rec = self.recorder
+        self.recorder = None
+        rec.close()
+        self.btn_rec.config(text="기록 시작")
+
+        if rec.n == 0:
+            self.v_pct.set("—")
+            self.v_energy.set("—")
+            self.rec_status.set(f"기록 종료 - 수신 데이터 없음 ({os.path.basename(rec.folder)})")
+            return
+
+        self.v_pct.set(f"{rec.last_pct:.1f}")
+        self.v_energy.set(f"{rec.energy_wh:.1f}")
+        self.rec_status.set(f"기록 종료: {os.path.basename(rec.folder)} "
+                            f"| {rec.elapsed():.0f}초 | {rec.n}샘플")
+
+    def _viz_target(self):
+        """이번 세션 기록이 우선, 없으면 시작할 때 불러온 폴더."""
+        return self.record_folder or self.loaded_folder
+
+    def on_visualize(self):
+        folder = self._viz_target()
+        if folder is None:
+            messagebox.showinfo("시각화", "표시할 데이터가 없습니다.\n"
+                                          "기록을 하거나, 프로그램을 다시 켜서 이전 폴더를 선택하세요.")
+            return
+
+        rows = load_csv(folder)
+        if len(rows) < 2:
+            messagebox.showinfo("시각화", "그래프를 그리기에 데이터가 부족합니다.")
+            return
+
+        try:
+            self._draw_all(folder, rows)
+        except ImportError:
+            messagebox.showerror("시각화", "matplotlib이 설치되어 있지 않습니다.\n"
+                                           "pip install matplotlib")
+        except Exception as e:
+            messagebox.showerror("시각화", f"그래프 생성 중 오류\n{e}")
+
+    def on_quit(self):
+        if self.recorder is not None:
+            # 기록 중 종료 = 데이터 유실이므로, 정상 마감(요약 파일까지)하고 닫는다
+            self._stop_record()
+        self.worker.stop()
+        self.root.destroy()
+
+    # ---------- 시각화 ----------
+
+    def _draw_all(self, folder, rows):
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib import font_manager
+
+        # 한글 폰트를 지정하지 않으면 제목/축이 두부(□)로 깨진다
+        installed = {f.name for f in font_manager.fontManager.ttflist}
+        for name in ("Malgun Gothic", "NanumGothic", "AppleGothic", "Gulim"):
+            if name in installed:
+                matplotlib.rcParams["font.family"] = name
+                break
+        matplotlib.rcParams["axes.unicode_minus"] = False   # 폰트에 유니코드 마이너스가 없으면 깨짐
+
+        tag = os.path.basename(folder)
+        t       = [r["t_s"] for r in rows]
+        pct     = [r["batt_pct"] for r in rows]
+        batt_a  = [r["batt_a"] for r in rows]
+        phase_a = [r["phase_a"] for r in rows]
+        power   = [r["power_w"] for r in rows]
+        rpm     = [r["rpm"] for r in rows]
+
+        def plot_pct(ax):
+            ax.plot(t, pct, color="tab:green")
+            ax.set_ylim(0, 100)
+            ax.set_xlabel("시간 (초)")
+            ax.set_ylabel("배터리 잔량 (%)")
+            ax.set_title(f"시간별 배터리 퍼센트  [{tag}]")
+            ax.grid(True, alpha=0.3)
+
+        def plot_currents(ax):
+            ax.plot(t, batt_a, color="tab:blue", label="버스전류 (배터리)")
+            ax.plot(t, phase_a, color="tab:red", label="상전류 (모터)")
+            ax.axhline(0, color="#999", lw=0.8)
+            ax.set_xlabel("시간 (초)")
+            ax.set_ylabel("전류 (A)")
+            ax.set_title(f"실시간 버스전류와 상전류  [{tag}]")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        def plot_power(ax):
+            ax.plot(t, power, color="tab:orange")
+            ax.axhline(0, color="#999", lw=0.8)
+            ax.set_xlabel("시간 (초)")
+            ax.set_ylabel("소모전력 (W)")
+            ax.set_title(f"실시간 소모전력 (배터리전압 x 버스전류)  [{tag}]")
+            ax.grid(True, alpha=0.3)
+
+        def plot_rpm(ax):
+            ax.plot(t, rpm, color="tab:purple")
+            ax.set_xlabel("시간 (초)")
+            ax.set_ylabel("모터 회전수 (rpm)")
+            ax.set_title(f"시간별 RPM  [{tag}]")
+            ax.grid(True, alpha=0.3)
+
+        for i, (title, fn) in enumerate([
+            ("시간별 배터리 퍼센트", plot_pct),
+            ("실시간 버스전류와 상전류", plot_currents),
+            ("실시간 소모전력", plot_power),
+            ("시간별 RPM", plot_rpm),
+        ]):
+            self._plot_window(f"{title} - {tag}", fn, offset=i * 30)
+
+    def _plot_window(self, title, draw_fn, offset=0):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+        # pyplot을 쓰면 tkinter mainloop와 이벤트 루프가 얽히므로 Toplevel에 직접 붙인다
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry(f"860x480+{80 + offset}+{60 + offset}")
+
+        fig = Figure(figsize=(8.4, 4.6), dpi=100)
+        draw_fn(fig.add_subplot(111))
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        NavigationToolbar2Tk(canvas, win).update()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
+def main():
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("vista")   # Windows 기본 테마
+    except tk.TclError:
+        pass
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":

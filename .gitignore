@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 .DS_Store
 Thumbs.db
+
+# y_can.py 기록 산출물 (스크립트 폴더에 csvdata_NNN 이 생긴다)
+csvdata_*/
+CANLOG.CSV
