@@ -2,13 +2,19 @@
 # ============================================================
 #  y_can.py  -  y_can.ino가 보내는 CAN 텔레메트리 GUI 대시보드 / 기록 / 시각화
 #
-#  - y_can.ino가 CAN(EZkontrol)에서 필요한 필드만 뽑아 시리얼로 보내면
-#    이 스크립트가 받아서 실시간 표시 + CSV 기록 + matplotlib 시각화를 한다.
-#    (ksae_canlogging.ino의 SD 로깅 역할을 PC측으로 옮긴 것)
+#  - y_can.ino는 두 갈래로 데이터를 낸다.
+#      SD카드  : CAN에서 받는 필드 전량을 16열 CSV로 기록 (CANLOG.CSV 양식)
+#      시리얼  : 대시보드용 5개 필드만 100ms 주기
+#    이 스크립트는 시리얼을 받아 실시간 표시 + **같은 16열 양식**으로 CSV를 쓴다.
+#    시리얼로 나오지 않는 열(온도/에러비트/브레이크/모드/컨택터/가속페달/lifeCounter)은
+#    공란으로 남긴다. 덕분에 SD카드에서 뽑은 CSV와 PC가 쓴 CSV를 같은 코드로 읽는다.
 #
 #  - 시리얼 라인 형식 : <speed_div10>,<batt_v>,<batt_a>,<phase_a>,<gear>
 #    ★ 첫 필드는 rpm을 10으로 나눈 정수 절사값이다. 실제 rpm = 값 x 10 ★
-#    '#'로 시작하는 줄은 아두이노의 경고 메시지이므로 건너뛴다.
+#    '#'로 시작하는 줄은 아두이노의 경고/이벤트 메시지이므로 건너뛴다.
+#
+#  - 배터리% / 전력량 같은 파생값은 CSV에 저장하지 않는다(양식을 지키려고).
+#    시각화·요약할 때 파일을 읽고 나서 그 자리에서 계산한다.
 #
 #  - Windows + 아두이노 메가 1대 연결 전제. 포트는 자동으로 찾아 붙고,
 #    실행 중 끊겨도 RECONNECT_INTERVAL_S(3초)마다 재연결을 시도한다.
@@ -50,14 +56,21 @@ FOLDER_PREFIX = "csvdata_"
 CSV_NAME      = "canlog.csv"
 SUMMARY_NAME  = "summary.txt"
 
-CSV_HEADER = ["t_s", "host_time", "speed_div10", "rpm",
-              "batt_v", "batt_a", "phase_a", "gear",
-              "power_w", "energy_wh", "batt_pct"]
+# CANLOG.CSV 16열 양식. 아두이노 SD 출력과 글자 하나까지 같아야 한다.
+CSV_HEADER = ["millis", "batteryVoltage_V", "batteryCurrent_A", "phaseCurrent_A",
+              "motorSpeed_rpm", "controllerTemp_C", "motorTemp_C", "accelPct",
+              "gear", "brake", "opMode", "dcContactor",
+              "err1_hex", "err2_hex", "err3_hex", "lifeCounter"]
 
-# ---- UI ----
-TICK_MS       = 100   # 큐 배출 + 화면 갱신 주기
-PCT_SMOOTH_N  = 20    # 배터리% 표시용 이동평균 표본수 (2초). CSV에는 원시값이 들어간다
-DT_SANITY_MAX = 1.0   # 이보다 긴 간격은 통신 끊김으로 보고 전력량 적분에서 제외
+# 이 열들이 없으면 CANLOG 양식이 아니라고 본다 (나머지는 공란이어도 읽는다)
+REQUIRED_COLS = ("millis", "batteryVoltage_V", "batteryCurrent_A",
+                 "phaseCurrent_A", "motorSpeed_rpm")
+
+# ---- 연산 ----
+TICK_MS          = 100   # 큐 배출 + 화면 갱신 주기
+PCT_SMOOTH_N     = 20    # 배터리% 표시용 이동평균 표본수 (2초). CSV에는 원시 전압이 들어간다
+DT_GAP_MAX_LIVE  = 1.0   # 실시간 기록(100ms 간격)에서 이보다 긴 간격은 통신 끊김으로 보고 적분 제외
+DT_GAP_MAX_FILE  = 3.0   # 파일 분석용. 아두이노 SD는 500ms 간격이라 여유를 더 둔다
 
 GEAR_NAMES = {0: "NO", 1: "R", 2: "N", 3: "D1", 4: "D2", 5: "D3", 6: "S", 7: "P"}
 
@@ -112,7 +125,7 @@ def parse_line(line):
 
 
 def batt_pct(v):
-    """전압 -> 배터리 잔량(%). 부하 중엔 전압강하로 실제보다 낮게 나오는 근사치다."""
+    """전압 -> 배터리 잔량(%). 부하 중엔 내부저항 전압강하로 실제보다 낮게 나오는 근사치다."""
     if BATT_V_FULL <= BATT_V_EMPTY:
         return 0.0
     pct = (v - BATT_V_EMPTY) / (BATT_V_FULL - BATT_V_EMPTY) * 100.0
@@ -159,8 +172,8 @@ class SerialWorker(threading.Thread):
                     raw = ser.readline()
                     now = time.monotonic()
                     if raw:
-                        line = raw.decode("ascii", errors="ignore").strip()
-                        # '#' 줄은 아두이노쪽 경고(MCP2515 초기화 실패 등)
+                        line = raw.decode("utf-8", errors="ignore").strip()
+                        # '#' 줄은 아두이노쪽 경고/이벤트(MCP2515 실패, 기어·에러 변화 등)
                         if line and not line.startswith("#"):
                             sample = parse_line(line)
                             if sample is not None:
@@ -208,7 +221,11 @@ def next_folder_path(base_dir):
 
 
 class Recorder:
-    """CSV 기록 + 누적 연산(전력량 등)을 함께 담당."""
+    """CANLOG 16열 양식으로 CSV를 쓰고, 표시용 누적값(전력량 등)을 함께 계산한다.
+
+    파생값(배터리%/전력량)은 CSV에 넣지 않는다 — 아두이노 SD 출력과 양식을
+    똑같이 유지해야 하므로. 나중에 읽을 때 compute_derived()로 다시 구한다.
+    """
 
     def __init__(self, folder):
         self.folder = folder
@@ -238,7 +255,7 @@ class Recorder:
         now = time.monotonic()
         t = now - self.t0
         dt = 0.0 if self._last_t is None else (now - self._last_t)
-        if dt > DT_SANITY_MAX:     # 끊겼다 붙은 구간을 전력량에 통째로 넣지 않는다
+        if dt > DT_GAP_MAX_LIVE:   # 끊겼다 붙은 구간을 전력량에 통째로 넣지 않는다
             dt = 0.0
         self._last_t = now
 
@@ -261,9 +278,15 @@ class Recorder:
         self.peak_phase_a = max(self.peak_phase_a, abs(phase_a))
         self.peak_batt_a = max(self.peak_batt_a, abs(batt_a))
 
-        self._w.writerow([f"{t:.3f}", f"{time.time():.3f}", speed_div10, rpm,
-                          f"{batt_v:.1f}", f"{batt_a:.1f}", f"{phase_a:.1f}", gear,
-                          f"{power_w:.1f}", f"{self.energy_wh:.4f}", f"{pct:.2f}"])
+        # 시리얼로 나오지 않는 열은 공란으로 둔다
+        row = {c: "" for c in CSV_HEADER}
+        row["millis"]           = int(round(t * 1000))   # 기록 시작 기준 경과 ms
+        row["batteryVoltage_V"] = f"{batt_v:.1f}"
+        row["batteryCurrent_A"] = f"{batt_a:.1f}"
+        row["phaseCurrent_A"]   = f"{phase_a:.1f}"
+        row["motorSpeed_rpm"]   = rpm
+        row["gear"]             = GEAR_NAMES.get(gear, "UNKNOWN")
+        self._w.writerow([row[c] for c in CSV_HEADER])
         self._f.flush()   # 전원이 갑자기 끊겨도 마지막 줄까지 남도록 (SD 로거와 같은 이유)
 
     def elapsed(self):
@@ -277,20 +300,22 @@ class Recorder:
         self._write_summary()
 
     def _write_summary(self):
-        dur = self.elapsed()
+        def fmt(v, nd=1):
+            return "-" if v is None else f"{round(v, nd)}"
+
         lines = [
             "y_can 기록 요약",
             "=" * 46,
-            f"폴더        : {os.path.basename(self.folder)}",
+            f"CSV         : {os.path.join(os.path.basename(self.folder), CSV_NAME)}",
             f"시작        : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.wall_start))}",
-            f"기록 시간   : {dur:.1f} 초",
+            f"기록 시간   : {self.elapsed():.1f} 초",
             f"샘플 수     : {self.n}",
             "",
             "--- 배터리 ---",
-            f"시작 전압   : {self.start_v if self.start_v is None else round(self.start_v, 1)} V",
-            f"종료 전압   : {self.last_v if self.last_v is None else round(self.last_v, 1)} V",
-            f"시작 잔량   : {self.start_pct if self.start_pct is None else round(self.start_pct, 1)} %",
-            f"종료 잔량   : {self.last_pct if self.last_pct is None else round(self.last_pct, 1)} %",
+            f"시작 전압   : {fmt(self.start_v)} V",
+            f"종료 전압   : {fmt(self.last_v)} V",
+            f"시작 잔량   : {fmt(self.start_pct)} %",
+            f"종료 잔량   : {fmt(self.last_pct)} %",
             f"(환산 기준  : 만충 {BATT_V_FULL} V / 방전종지 {BATT_V_EMPTY} V)",
             "",
             "--- 전력량 (배터리전압 x 버스전류 적분) ---",
@@ -302,6 +327,10 @@ class Recorder:
             f"최대 RPM    : {self.peak_rpm}",
             f"최대 상전류 : {self.peak_phase_a:.1f} A",
             f"최대 버스전류: {self.peak_batt_a:.1f} A",
+            "",
+            "※ CSV는 CANLOG 16열 양식이며, 시리얼로 나오지 않는 열(온도/에러비트/",
+            "   브레이크/모드/컨택터/가속페달/lifeCounter)은 공란이다.",
+            "   SD카드에서 뽑은 CSV에는 그 열들도 채워져 있다.",
         ]
         try:
             with open(os.path.join(self.folder, SUMMARY_NAME), "w", encoding="utf-8") as f:
@@ -310,51 +339,91 @@ class Recorder:
             pass
 
 
-# ====================== 저장된 폴더 읽기 ======================
+# ====================== CSV 읽기 + 파생값 계산 ======================
 
-def resolve_data_folder(path):
-    """사용자가 고른 폴더가 csvdata_NNN 자신이 아니라 그 상위일 수도 있어 둘 다 받아준다."""
-    if not path or not os.path.isdir(path):
-        return None
-    if os.path.isfile(os.path.join(path, CSV_NAME)):
-        return path
-    pat = re.compile(r"^" + re.escape(FOLDER_PREFIX) + r"\d{3}$")
-    subs = [os.path.join(path, n) for n in os.listdir(path)
-            if pat.match(n) and os.path.isfile(os.path.join(path, n, CSV_NAME))]
-    if not subs:
-        return None
-    subs.sort(key=os.path.getmtime)
-    return subs[-1]
+def load_canlog(path):
+    """CANLOG 16열 CSV를 읽어 (rows, 오류메시지) 반환.
 
+    아두이노 SD 출력과 PC 기록 출력이 같은 양식이라 둘 다 그대로 처리된다.
+    PC 출력의 공란 열은 애초에 읽지 않으므로 문제되지 않는다.
+    """
+    if not path or not os.path.isfile(path):
+        return None, "파일을 찾을 수 없습니다."
 
-def load_csv(folder):
-    """CSV를 읽어 dict 리스트로. 값은 전부 숫자라 float으로 변환한다."""
-    path = os.path.join(folder, CSV_NAME)
-    if not os.path.isfile(path):
-        return []
     rows = []
     try:
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            for r in csv.DictReader(f):
+        with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            names = reader.fieldnames or []
+            missing = [c for c in REQUIRED_COLS if c not in names]
+            if missing:
+                return None, "CANLOG 양식이 아닙니다.\n없는 열: " + ", ".join(missing)
+
+            for raw in reader:
                 try:
-                    rows.append({k: float(v) for k, v in r.items() if v is not None})
-                except (ValueError, TypeError):
-                    continue   # 기록 중 전원이 끊겨 잘린 마지막 줄 등
-    except OSError:
-        return []
-    return rows
+                    ms   = float(raw["millis"])
+                    volt = float(raw["batteryVoltage_V"])
+                    amp  = float(raw["batteryCurrent_A"])
+                    ph   = float(raw["phaseCurrent_A"])
+                    rpm  = float(raw["motorSpeed_rpm"])
+                except (TypeError, ValueError):
+                    continue    # 공란이거나, 기록 중 전원이 끊겨 잘린 마지막 줄
+                rows.append({"millis": ms, "volt": volt, "amp": amp,
+                             "phase": ph, "rpm": rpm,
+                             "gear": (raw.get("gear") or "").strip()})
+    except OSError as e:
+        return None, f"파일을 열 수 없습니다.\n{e}"
 
-
-def summarize_rows(rows):
-    """저장된 CSV로부터 [1] 배터리% / [2] 총 사용 전력량을 복원."""
     if not rows:
-        return None
-    last = rows[-1]
+        return None, "읽을 수 있는 데이터 줄이 없습니다."
+    return rows, None
+
+
+def compute_derived(rows):
+    """millis 간격으로 전력량을 적분하고 각 행에 t_s/power_w/energy_wh/batt_pct를 채운다.
+
+    파생값을 CSV에 저장하지 않는 대신 읽을 때마다 여기서 만든다.
+    시간축은 첫 줄을 0으로 맞춘다 — 아두이노 millis는 부팅 후 경과라 1048처럼 시작한다.
+    """
+    t0 = rows[0]["millis"]
+    energy = discharge = regen = 0.0
+    peak_rpm = peak_phase = peak_amp = 0.0
+    prev_ms = None
+
+    for r in rows:
+        ms = r["millis"]
+        dt = 0.0 if prev_ms is None else (ms - prev_ms) / 1000.0
+        if dt < 0.0 or dt > DT_GAP_MAX_FILE:
+            dt = 0.0      # 음수 = 로그가 이어붙어 millis가 되돌아간 경우
+        prev_ms = ms
+
+        p = r["volt"] * r["amp"]
+        wh = p * dt / 3600.0
+        energy += wh
+        if wh >= 0.0:
+            discharge += wh
+        else:
+            regen += -wh
+
+        r["t_s"]       = (ms - t0) / 1000.0
+        r["power_w"]   = p
+        r["energy_wh"] = energy
+        r["batt_pct"]  = batt_pct(r["volt"])
+
+        peak_rpm   = max(peak_rpm, r["rpm"])
+        peak_phase = max(peak_phase, abs(r["phase"]))
+        peak_amp   = max(peak_amp, abs(r["amp"]))
+
     return {
-        "pct": last.get("batt_pct"),
-        "energy_wh": last.get("energy_wh"),
-        "duration": last.get("t_s"),
+        "pct": rows[-1]["batt_pct"],
+        "energy_wh": energy,
+        "discharge_wh": discharge,
+        "regen_wh": regen,
+        "duration": rows[-1]["t_s"],
         "n": len(rows),
+        "peak_rpm": peak_rpm,
+        "peak_phase_a": peak_phase,
+        "peak_batt_a": peak_amp,
     }
 
 
@@ -371,16 +440,16 @@ class App:
         self.status_q = queue.Queue()
         self.worker = SerialWorker(self.data_q, self.status_q)
 
-        self.recorder = None          # 기록 중이면 Recorder 인스턴스
-        self.record_folder = None     # 이번 세션에서 기록한(하는) 폴더
-        self.loaded_folder = None     # 시작할 때 불러온 이전 데이터 폴더
+        self.recorder = None        # 기록 중이면 Recorder 인스턴스
+        self.record_csv = None      # 이번 세션에서 기록한(하는) CSV 경로
+        self.loaded_csv = None      # 시작할 때 불러온 이전 CSV 경로
         self.pct_buf = collections.deque(maxlen=PCT_SMOOTH_N)
 
         self._build_ui()
         self.worker.start()
         root.protocol("WM_DELETE_WINDOW", self.on_quit)
         root.after(TICK_MS, self._tick)
-        root.after(250, self._startup_folder_prompt)   # 창이 그려진 뒤에 띄운다
+        root.after(250, self._startup_file_prompt)   # 창이 그려진 뒤에 띄운다
 
     # ---------- UI 구성 ----------
 
@@ -428,33 +497,32 @@ class App:
                   anchor="center").pack(fill=tk.BOTH, expand=True, padx=6, pady=8)
         return var
 
-    # ---------- 시작 시 이전 폴더 불러오기 ----------
+    # ---------- 시작 시 이전 CSV 불러오기 ----------
 
-    def _startup_folder_prompt(self):
-        path = filedialog.askdirectory(
-            title="이전 데이터 폴더 선택 (취소하면 비운 채로 시작)",
-            initialdir=BASE_DIR)
+    def _startup_file_prompt(self):
+        path = filedialog.askopenfilename(
+            title="이전 데이터 CSV 파일 선택 (취소하면 비운 채로 시작)",
+            initialdir=BASE_DIR,
+            filetypes=[("CANLOG CSV", "*.csv"), ("모든 파일", "*.*")])
         if not path:
             self.rec_status.set("대기 중 (이전 데이터 없음)")
             return
 
-        folder = resolve_data_folder(path)
-        if folder is None:
-            messagebox.showwarning("불러오기", f"{CSV_NAME} 이 없는 폴더입니다.\n비운 채로 시작합니다.")
+        rows, err = load_canlog(path)
+        if rows is None:
+            messagebox.showwarning("불러오기", f"{os.path.basename(path)}\n\n{err}")
+            self.rec_status.set("대기 중 (불러오기 실패)")
             return
 
-        summary = summarize_rows(load_csv(folder))
-        if summary is None:
-            messagebox.showwarning("불러오기", "기록이 비어 있는 폴더입니다.")
-            return
-
-        self.loaded_folder = folder
+        summary = compute_derived(rows)
+        self.loaded_csv = path
         self._show_summary(summary)
-        self.rec_status.set(f"불러옴: {os.path.basename(folder)} ({summary['n']}샘플)")
+        self.rec_status.set(f"불러옴: {os.path.basename(path)} "
+                            f"({summary['n']}샘플 / {summary['duration']:.0f}초)")
 
     def _show_summary(self, s):
-        self.v_pct.set("—" if s["pct"] is None else f"{s['pct']:.1f}")
-        self.v_energy.set("—" if s["energy_wh"] is None else f"{s['energy_wh']:.1f}")
+        self.v_pct.set(f"{s['pct']:.1f}")
+        self.v_energy.set(f"{s['energy_wh']:.1f}")
 
     # ---------- 주기 갱신 ----------
 
@@ -495,7 +563,7 @@ class App:
         if self.pct_buf:
             self.v_pct.set(f"{sum(self.pct_buf) / len(self.pct_buf):.1f}")
         self.v_energy.set(f"{self.recorder.energy_wh:.1f}")
-        self.rec_status.set(f"● 기록 중 {os.path.basename(self.record_folder)} "
+        self.rec_status.set(f"● 기록 중 {os.path.basename(os.path.dirname(self.record_csv))} "
                             f"| {self.recorder.elapsed():.0f}초 | {self.recorder.n}샘플")
 
     # ---------- 버튼 ----------
@@ -515,7 +583,7 @@ class App:
             return
 
         self.recorder = recorder
-        self.record_folder = folder
+        self.record_csv = recorder.csv_path
         self.pct_buf.clear()
 
         # 이전에 불러와 띄워둔 값은 지운다 (디스크의 데이터는 그대로 남는다)
@@ -530,36 +598,41 @@ class App:
         self.recorder = None
         rec.close()
         self.btn_rec.config(text="기록 시작")
+        tag = os.path.basename(rec.folder)
 
         if rec.n == 0:
             self.v_pct.set("—")
             self.v_energy.set("—")
-            self.rec_status.set(f"기록 종료 - 수신 데이터 없음 ({os.path.basename(rec.folder)})")
+            self.rec_status.set(f"기록 종료 - 수신 데이터 없음 ({tag})")
             return
 
         self.v_pct.set(f"{rec.last_pct:.1f}")
         self.v_energy.set(f"{rec.energy_wh:.1f}")
-        self.rec_status.set(f"기록 종료: {os.path.basename(rec.folder)} "
-                            f"| {rec.elapsed():.0f}초 | {rec.n}샘플")
+        self.rec_status.set(f"기록 종료: {tag} | {rec.elapsed():.0f}초 | {rec.n}샘플")
 
     def _viz_target(self):
-        """이번 세션 기록이 우선, 없으면 시작할 때 불러온 폴더."""
-        return self.record_folder or self.loaded_folder
+        """이번 세션 기록이 우선, 없으면 시작할 때 불러온 CSV."""
+        return self.record_csv or self.loaded_csv
 
     def on_visualize(self):
-        folder = self._viz_target()
-        if folder is None:
+        path = self._viz_target()
+        if path is None:
             messagebox.showinfo("시각화", "표시할 데이터가 없습니다.\n"
-                                          "기록을 하거나, 프로그램을 다시 켜서 이전 폴더를 선택하세요.")
+                                          "기록을 하거나, 프로그램을 다시 켜서 이전 CSV를 선택하세요.")
             return
 
-        rows = load_csv(folder)
+        # 파일을 먼저 읽고 나서 파생값을 계산한다 (CSV에는 원시 열만 들어 있다)
+        rows, err = load_canlog(path)
+        if rows is None:
+            messagebox.showerror("시각화", f"{os.path.basename(path)}\n\n{err}")
+            return
         if len(rows) < 2:
             messagebox.showinfo("시각화", "그래프를 그리기에 데이터가 부족합니다.")
             return
+        compute_derived(rows)
 
         try:
-            self._draw_all(folder, rows)
+            self._draw_all(path, rows)
         except ImportError:
             messagebox.showerror("시각화", "matplotlib이 설치되어 있지 않습니다.\n"
                                            "pip install matplotlib")
@@ -575,7 +648,7 @@ class App:
 
     # ---------- 시각화 ----------
 
-    def _draw_all(self, folder, rows):
+    def _draw_all(self, path, rows):
         import matplotlib
         matplotlib.use("TkAgg")
         from matplotlib import font_manager
@@ -586,13 +659,13 @@ class App:
             if name in installed:
                 matplotlib.rcParams["font.family"] = name
                 break
-        matplotlib.rcParams["axes.unicode_minus"] = False   # 폰트에 유니코드 마이너스가 없으면 깨짐
+        matplotlib.rcParams["axes.unicode_minus"] = False   # 유니코드 마이너스가 없으면 깨짐
 
-        tag = os.path.basename(folder)
+        tag = os.path.basename(path)
         t       = [r["t_s"] for r in rows]
         pct     = [r["batt_pct"] for r in rows]
-        batt_a  = [r["batt_a"] for r in rows]
-        phase_a = [r["phase_a"] for r in rows]
+        batt_a  = [r["amp"] for r in rows]
+        phase_a = [r["phase"] for r in rows]
         power   = [r["power_w"] for r in rows]
         rpm     = [r["rpm"] for r in rows]
 
