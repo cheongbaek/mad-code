@@ -9,3 +9,8 @@ canlog_*.csv
 canlog_*_summary.txt
 CANLOG*.CSV
 csvdata_*/
+
+# gold/ 는 별개 저장소(github.com/cheongbaek/gold)의 작업본이다.
+# 여기서 제외하지 않으면 `git add .` 한 번에 .gitmodules 없는 깨진 gitlink가 커밋되고,
+# mad-code 를 새로 clone 하면 gold/ 가 빈 폴더로 나온다. 관리는 gold/ 안에서 따로 한다.
+gold/
