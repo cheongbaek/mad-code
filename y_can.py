@@ -16,6 +16,10 @@
 #  - 배터리% / 전력량 같은 파생값은 CSV에 저장하지 않는다(양식을 지키려고).
 #    시각화·요약할 때 파일을 읽고 나서 그 자리에서 계산한다.
 #
+#  - 입출력 모두 '폴더 없이 평평한 CSV 파일' 단위다.
+#      불러오기 : CSV 파일 하나를 고른다 (SD에서 뽑은 CANLOG01.CSV 도 그대로 된다)
+#      기록     : canlog_001.csv, canlog_002.csv ... 로 옆에 쌓인다 (+ _summary.txt)
+#
 #  - Windows + 아두이노 메가 1대 연결 전제. 포트는 자동으로 찾아 붙고,
 #    실행 중 끊겨도 RECONNECT_INTERVAL_S(3초)마다 재연결을 시도한다.
 #    아두이노가 없는 상태로 실행해도 GUI는 정상 동작한다.
@@ -37,12 +41,21 @@ from serial.tools import list_ports
 
 # ====================== 설정값 ======================
 
-# ---- 배터리 스펙 (배터리 퍼센트 환산 기준) ----
-# ★★ 반드시 실제 팩 스펙으로 검증할 것 ★★
-# 아래는 "정격 58V = 16S 리튬이온"으로 가정한 값이다(16 x 3.6V = 57.6V).
-# 팩이 다르면(예: LiFePO4 16S면 만충 58.4V / 방전종지 40V) 이 두 값만 고치면 된다.
-BATT_V_FULL  = 67.2   # 만충전 전압 (16 x 4.20V)
-BATT_V_EMPTY = 48.0   # 방전종지 전압 (16 x 3.00V)
+# ---- 배터리 스펙 ([1] 배터리 퍼센트 환산에만 쓰인다) ----
+# 실제 팩 : 52V 80Ah, 14INR21/70, 14S16P, Samsung SDI INR21700-50S
+#   14S x 4.20V = 58.8V  만충
+#   14S x 3.70V = 51.8V  공칭(= 표기 52V)
+#   14S x 3.00V = 42.0V  실용 하한 (이 아래로는 전압이 급락해 선형환산이 무의미해지고,
+#                                   차량 BMS도 보통 이 근처에서 컷한다)
+#   14S x 2.50V = 35.0V  셀 데이터시트 방전종지 (절대 하한)
+#   16P x 5.0Ah = 80Ah   표기 용량과 일치
+#
+# ★ 실측 만충이 약 58V이므로, 만충에서 이 환산은 약 95%를 가리킨다. 이는 충전기가
+#   4.2V/셀까지 올리지 않는다는 뜻이며(수명을 위해 일부러 덜 채우는 충전기가 많다)
+#   틀린 표시가 아니다. 만충을 100%로 보이게 하려면 BATT_V_FULL을 58.0으로 내릴 것.
+# ★ 하한을 셀 데이터시트값(35.0)으로 바꾸면 같은 전압에서 % 가 더 높게 나온다.
+BATT_V_FULL  = 58.8
+BATT_V_EMPTY = 42.0
 
 # ---- 시리얼 ----
 BAUD                  = 115200
@@ -51,10 +64,8 @@ RECONNECT_INTERVAL_S  = 3.0    # 연결 실패/끊김 시 재시도 간격
 DATA_WATCHDOG_S       = 5.0    # 이 시간 동안 유효 데이터가 없으면 끊긴 것으로 보고 재연결
 
 # ---- 기록 ----
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))  # csvdata_NNN 폴더가 생기는 위치
-FOLDER_PREFIX = "csvdata_"
-CSV_NAME      = "canlog.csv"
-SUMMARY_NAME  = "summary.txt"
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))  # canlog_NNN.csv 가 생기는 위치
+FILE_PREFIX = "canlog_"                                   # 폴더 없이 파일만 평평하게 쌓는다
 
 # CANLOG.CSV 16열 양식. 아두이노 SD 출력과 글자 하나까지 같아야 한다.
 CSV_HEADER = ["millis", "batteryVoltage_V", "batteryCurrent_A", "phaseCurrent_A",
@@ -199,15 +210,15 @@ class SerialWorker(threading.Thread):
 
 # ====================== 기록 ======================
 
-def next_folder_path(base_dir):
-    """csvdata_001 ... csvdata_999 -> csvdata_000 -> csvdata_001(덮어쓰기) 순환."""
-    pat = re.compile(r"^" + re.escape(FOLDER_PREFIX) + r"(\d{3})$")
+def next_csv_path(base_dir):
+    """canlog_001.csv ... canlog_999.csv -> canlog_000.csv -> canlog_001.csv(덮어쓰기) 순환."""
+    pat = re.compile(r"^" + re.escape(FILE_PREFIX) + r"(\d{3})\.csv$", re.IGNORECASE)
     found = []
     try:
         for name in os.listdir(base_dir):
             m = pat.match(name)
             full = os.path.join(base_dir, name)
-            if m and os.path.isdir(full):
+            if m and os.path.isfile(full):
                 found.append((os.path.getmtime(full), int(m.group(1))))
     except OSError:
         pass
@@ -215,9 +226,9 @@ def next_folder_path(base_dir):
     if not found:
         n = 1
     else:
-        found.sort()                      # 번호가 순환하므로 '가장 최근에 쓴 폴더' 기준으로 잇는다
+        found.sort()                      # 번호가 순환하므로 '가장 최근에 쓴 파일' 기준으로 잇는다
         n = (found[-1][1] + 1) % 1000
-    return os.path.join(base_dir, f"{FOLDER_PREFIX}{n:03d}")
+    return os.path.join(base_dir, f"{FILE_PREFIX}{n:03d}.csv")
 
 
 class Recorder:
@@ -227,10 +238,10 @@ class Recorder:
     똑같이 유지해야 하므로. 나중에 읽을 때 compute_derived()로 다시 구한다.
     """
 
-    def __init__(self, folder):
-        self.folder = folder
-        os.makedirs(folder, exist_ok=True)
-        self.csv_path = os.path.join(folder, CSV_NAME)
+    def __init__(self, csv_path):
+        self.csv_path = csv_path
+        # 요약은 CSV 옆에 같은 이름으로 (canlog_001.csv -> canlog_001_summary.txt)
+        self.summary_path = os.path.splitext(csv_path)[0] + "_summary.txt"
         self._f = open(self.csv_path, "w", newline="", encoding="utf-8")
         self._w = csv.writer(self._f)
         self._w.writerow(CSV_HEADER)
@@ -306,7 +317,7 @@ class Recorder:
         lines = [
             "y_can 기록 요약",
             "=" * 46,
-            f"CSV         : {os.path.join(os.path.basename(self.folder), CSV_NAME)}",
+            f"CSV         : {os.path.basename(self.csv_path)}",
             f"시작        : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.wall_start))}",
             f"기록 시간   : {self.elapsed():.1f} 초",
             f"샘플 수     : {self.n}",
@@ -333,7 +344,7 @@ class Recorder:
             "   SD카드에서 뽑은 CSV에는 그 열들도 채워져 있다.",
         ]
         try:
-            with open(os.path.join(self.folder, SUMMARY_NAME), "w", encoding="utf-8") as f:
+            with open(self.summary_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
         except OSError:
             pass
@@ -503,7 +514,8 @@ class App:
         path = filedialog.askopenfilename(
             title="이전 데이터 CSV 파일 선택 (취소하면 비운 채로 시작)",
             initialdir=BASE_DIR,
-            filetypes=[("CANLOG CSV", "*.csv"), ("모든 파일", "*.*")])
+            filetypes=[("CSV 파일", "*.csv")],
+            defaultextension=".csv")
         if not path:
             self.rec_status.set("대기 중 (이전 데이터 없음)")
             return
@@ -563,7 +575,7 @@ class App:
         if self.pct_buf:
             self.v_pct.set(f"{sum(self.pct_buf) / len(self.pct_buf):.1f}")
         self.v_energy.set(f"{self.recorder.energy_wh:.1f}")
-        self.rec_status.set(f"● 기록 중 {os.path.basename(os.path.dirname(self.record_csv))} "
+        self.rec_status.set(f"● 기록 중 {os.path.basename(self.record_csv)} "
                             f"| {self.recorder.elapsed():.0f}초 | {self.recorder.n}샘플")
 
     # ---------- 버튼 ----------
@@ -575,11 +587,11 @@ class App:
             self._stop_record()
 
     def _start_record(self):
-        folder = next_folder_path(BASE_DIR)
+        path = next_csv_path(BASE_DIR)
         try:
-            recorder = Recorder(folder)
+            recorder = Recorder(path)
         except OSError as e:
-            messagebox.showerror("기록 시작 실패", f"{folder}\n{e}")
+            messagebox.showerror("기록 시작 실패", f"{path}\n{e}")
             return
 
         self.recorder = recorder
@@ -591,14 +603,14 @@ class App:
         self.v_energy.set("—")
 
         self.btn_rec.config(text="기록 중지")
-        self.rec_status.set(f"● 기록 중 {os.path.basename(folder)}")
+        self.rec_status.set(f"● 기록 중 {os.path.basename(path)}")
 
     def _stop_record(self):
         rec = self.recorder
         self.recorder = None
         rec.close()
         self.btn_rec.config(text="기록 시작")
-        tag = os.path.basename(rec.folder)
+        tag = os.path.basename(rec.csv_path)
 
         if rec.n == 0:
             self.v_pct.set("—")
