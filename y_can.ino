@@ -5,7 +5,7 @@
 // EZkontrol B48-1000 CAN -> PC 시리얼 브리지
 // 기준 문서: EZkontrol CANBUS MCU to METER V1.1 20230727 (Golden Motor 공식)
 // SD카드 없이 필요한 필드만 추출해 시리얼로 전송한다. CSV 생성/가공은
-// PC측 ksae_can.py가 담당 (ksae_canlogging.ino의 SD 로깅 역할을 대체).
+// PC측 y_can.py가 담당 (ksae_canlogging.ino의 SD 로깅 역할을 대체).
 // =====================================================================
 
 #define CAN_CS   53
@@ -41,7 +41,7 @@ void setup()
 
   if (CAN0.begin(MCP_ANY, CAN_250KBPS, MCP_8MHZ) != CAN_OK)
   {
-    // '#' 로 시작하는 줄은 ksae_can.py가 무시하므로, 데이터 형식을 깨지 않고 알릴 수 있다
+    // '#' 로 시작하는 줄은 y_can.py가 무시하므로, 데이터 형식을 깨지 않고 알릴 수 있다
     unsigned long lastWarn = 0;
     while (1)
     {
