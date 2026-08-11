@@ -1,138 +1,62 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-#  y_can.py  -  y_can.ino가 보내는 CAN 텔레메트리 GUI 대시보드 / 기록 / 시각화
+#  y_can.py  -  y_can.ino가 SD카드에 남긴 CAN 로그 CSV를 불러와 요약/시각화
 #
-#  - y_can.ino는 두 갈래로 데이터를 낸다.
-#      SD카드  : CAN에서 받는 필드 전량을 16열 CSV로 기록 (CANLOG.CSV 양식)
-#      시리얼  : 대시보드용 5개 필드만 100ms 주기
-#    이 스크립트는 시리얼을 받아 실시간 표시 + **같은 16열 양식**으로 CSV를 쓴다.
-#    시리얼로 나오지 않는 열(온도/에러비트/브레이크/모드/컨택터/가속페달/lifeCounter)은
-#    공란으로 남긴다. 덕분에 SD카드에서 뽑은 CSV와 PC가 쓴 CSV를 같은 코드로 읽는다.
+#  - 이 스크립트는 '파일을 불러와 보는' 기능만 한다. 시리얼 실시간 수신은 없다.
+#    아두이노를 PC에 연결할 필요도, 아두이노가 켜져 있을 필요도 없다.
 #
-#  - 시리얼 라인 형식 : <speed_div10>,<batt_v>,<batt_a>,<phase_a>,<gear>
-#    ★ 첫 필드는 rpm을 10으로 나눈 정수 절사값이다. 실제 rpm = 값 x 10 ★
-#    '#'로 시작하는 줄은 아두이노의 경고/이벤트 메시지이므로 건너뛴다.
+#  - 읽는 파일 : y_can.ino가 SD카드에 쓴 CANLOG 16열 CSV.
+#    부팅마다 1.csv, 2.csv, 3.csv ... 로 번호가 올라간다(아두이노에 시계가 없어
+#    날짜 대신 번호로 구분한다). SD카드에서 그 파일을 PC로 옮겨 열면 된다.
 #
-#  - 배터리% / 전력량 같은 파생값은 CSV에 저장하지 않는다(양식을 지키려고).
-#    시각화·요약할 때 파일을 읽고 나서 그 자리에서 계산한다.
+#  - 16열 양식 (아두이노 SD 출력과 글자 하나까지 같다) :
+#      millis, batteryVoltage_V, batteryCurrent_A, phaseCurrent_A, motorSpeed_rpm,
+#      controllerTemp_C, motorTemp_C, accelPct, gear, brake, opMode, dcContactor,
+#      err1_hex, err2_hex, err3_hex, lifeCounter
 #
-#  - 입출력 모두 '폴더 없이 평평한 CSV 파일' 단위다.
-#      불러오기 : CSV 파일 하나를 고른다 (SD에서 뽑은 CANLOG01.CSV 도 그대로 된다)
-#      기록     : canlog_001.csv, canlog_002.csv ... 로 옆에 쌓인다 (+ _summary.txt)
+#  - 배터리% / 전력량 / 평균온도 같은 파생값은 CSV에 없다. 파일을 읽고 나서
+#    compute_derived()가 그 자리에서 계산한다.
 #
-#  - Windows + 아두이노 메가 1대 연결 전제. 포트는 자동으로 찾아 붙고,
-#    실행 중 끊겨도 RECONNECT_INTERVAL_S(3초)마다 재연결을 시도한다.
-#    아두이노가 없는 상태로 실행해도 GUI는 정상 동작한다.
+#  - 온도(controllerTemp_C / motorTemp_C)는 SD 로그에만 들어 있다. 예전에
+#    PC가 시리얼로 받아 쓴 CSV에는 그 열이 공란이므로, 그런 파일을 열면
+#    온도 표시와 온도 그래프는 자동으로 비활성된다.
 # ============================================================
 
-import collections
 import csv
 import os
-import queue
-import re
-import threading
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-
-import serial
-from serial.tools import list_ports
 
 
 # ====================== 설정값 ======================
 
 # ---- 배터리 스펙 ([1] 배터리 퍼센트 환산에만 쓰인다) ----
 # 실제 팩 : 52V 80Ah, 14INR21/70, 14S16P, Samsung SDI INR21700-50S
-#   14S x 4.20V = 58.8V  만충
-#   14S x 3.70V = 51.8V  공칭(= 표기 52V)
-#   14S x 3.00V = 42.0V  실용 하한 (이 아래로는 전압이 급락해 선형환산이 무의미해지고,
-#                                   차량 BMS도 보통 이 근처에서 컷한다)
-#   14S x 2.50V = 35.0V  셀 데이터시트 방전종지 (절대 하한)
-#   16P x 5.0Ah = 80Ah   표기 용량과 일치
 #
-# ★ 실측 만충이 약 58V이므로, 만충에서 이 환산은 약 95%를 가리킨다. 이는 충전기가
-#   4.2V/셀까지 올리지 않는다는 뜻이며(수명을 위해 일부러 덜 채우는 충전기가 많다)
-#   틀린 표시가 아니다. 만충을 100%로 보이게 하려면 BATT_V_FULL을 58.0으로 내릴 것.
-# ★ 하한을 셀 데이터시트값(35.0)으로 바꾸면 같은 전압에서 % 가 더 높게 나온다.
-BATT_V_FULL  = 58.8
-BATT_V_EMPTY = 42.0
+# 58V를 100%, 40V를 0%로 잡는다(실측 만충 기준).
+#   58.0V / 14S = 4.14 V/셀  - 충전기가 4.2V까지 채우지 않는 실측 만충
+#   40.0V / 14S = 2.86 V/셀  - 셀 데이터시트 방전종지(2.5V)보다는 위, 실용 하한
+#
+# ★ 전압-잔량을 직선으로 잇는 근사다. 리튬 방전곡선은 중간이 평평해 실제로는
+#   50% 부근에서 실물보다 낮게, 양 끝에서 높게 나온다. 게다가 주행 중에는
+#   내부저항 전압강하 때문에 더 낮게 찍힌다 - 정지 상태 값이 가장 믿을 만하다.
+BATT_V_FULL  = 58.0
+BATT_V_EMPTY = 40.0
 
-# ---- 시리얼 ----
-BAUD                  = 115200
-SERIAL_TIMEOUT_S      = 1.0    # readline 타임아웃
-RECONNECT_INTERVAL_S  = 3.0    # 연결 실패/끊김 시 재시도 간격
-DATA_WATCHDOG_S       = 5.0    # 이 시간 동안 유효 데이터가 없으면 끊긴 것으로 보고 재연결
+# 파일 대화상자가 처음 열어 보여줄 위치
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ---- 기록 ----
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))  # canlog_NNN.csv 가 생기는 위치
-FILE_PREFIX = "canlog_"                                   # 폴더 없이 파일만 평평하게 쌓는다
-
-# CANLOG.CSV 16열 양식. 아두이노 SD 출력과 글자 하나까지 같아야 한다.
-CSV_HEADER = ["millis", "batteryVoltage_V", "batteryCurrent_A", "phaseCurrent_A",
-              "motorSpeed_rpm", "controllerTemp_C", "motorTemp_C", "accelPct",
-              "gear", "brake", "opMode", "dcContactor",
-              "err1_hex", "err2_hex", "err3_hex", "lifeCounter"]
-
-# 이 열들이 없으면 CANLOG 양식이 아니라고 본다 (나머지는 공란이어도 읽는다)
+# 이 열들이 없으면 CANLOG 양식이 아니라고 본다
 REQUIRED_COLS = ("millis", "batteryVoltage_V", "batteryCurrent_A",
                  "phaseCurrent_A", "motorSpeed_rpm")
 
-# ---- 연산 ----
-TICK_MS          = 100   # 큐 배출 + 화면 갱신 주기
-PCT_SMOOTH_N     = 20    # 배터리% 표시용 이동평균 표본수 (2초). CSV에는 원시 전압이 들어간다
-DT_GAP_MAX_LIVE  = 1.0   # 실시간 기록(100ms 간격)에서 이보다 긴 간격은 통신 끊김으로 보고 적분 제외
-DT_GAP_MAX_FILE  = 3.0   # 파일 분석용. 아두이노 SD는 500ms 간격이라 여유를 더 둔다
+# 온도 열. 없거나 공란이어도 파일은 정상으로 읽고, 온도 기능만 꺼진다
+COL_MOTOR_TEMP = "motorTemp_C"
+COL_CTRL_TEMP  = "controllerTemp_C"
 
-GEAR_NAMES = {0: "NO", 1: "R", 2: "N", 3: "D1", 4: "D2", 5: "D3", 6: "S", 7: "P"}
-
-
-# ====================== 포트 자동 탐지 ======================
-
-KNOWN_MEGA_VIDPID = {(0x2341, 0x0042), (0x2341, 0x0010), (0x2341, 0x003F), (0x2A03, 0x0042)}
-CANDIDATE_VIDS = {0x1A86, 0x0403, 0x10C4, 0x2341, 0x2A03}  # CH340 / FTDI / CP210x / Arduino
-
-
-def find_arduino_port():
-    """아두이노로 보이는 COM 포트를 점수순으로 1개 골라 반환. 없으면 None.
-
-    '아두이노면 닥치고 연결' 전제라 사용자에게 묻지 않는다. 다만 블루투스
-    가상 COM 포트는 아두이노와 무관하게 흔히 잡히므로 후보에서 제외한다.
-    """
-    best, best_score = None, 0
-    for p in list_ports.comports():
-        desc = (p.description or "").lower()
-        hwid = (p.hwid or "").lower()
-        if "bluetooth" in desc or "bluetooth" in hwid:
-            continue
-
-        if p.vid is not None and (p.vid, p.pid) in KNOWN_MEGA_VIDPID:
-            score = 100
-        elif "mega" in desc:
-            score = 90
-        elif "arduino" in desc:
-            score = 80
-        elif p.vid in CANDIDATE_VIDS:
-            score = 70
-        elif "usb-serial" in desc or "usb serial" in desc:
-            score = 50
-        else:
-            score = 0
-
-        if score > best_score:
-            best, best_score = p, score
-    return best.device if best else None
-
-
-def parse_line(line):
-    """'654,58.3,12.5,45.2,3' -> (speed_div10, batt_v, batt_a, phase_a, gear)"""
-    parts = line.split(",")
-    if len(parts) != 5:
-        return None
-    try:
-        return (int(parts[0]), float(parts[1]), float(parts[2]),
-                float(parts[3]), int(parts[4]))
-    except ValueError:
-        return None
+# 아두이노 SD는 500ms 간격으로 쓴다. 이보다 긴 간격은 전원이 끊겼다 붙은
+# 구간으로 보고 전력량 적분에서 뺀다
+DT_GAP_MAX_FILE = 3.0
 
 
 def batt_pct(v):
@@ -143,221 +67,21 @@ def batt_pct(v):
     return max(0.0, min(100.0, pct))
 
 
-# ====================== 시리얼 수신 스레드 ======================
-
-class SerialWorker(threading.Thread):
-    """백그라운드로 시리얼을 읽어 큐에 넣는다. 연결 실패/끊김은 스스로 재시도한다."""
-
-    def __init__(self, data_q, status_q):
-        super().__init__(daemon=True)
-        self.data_q = data_q
-        self.status_q = status_q
-        self._stop_evt = threading.Event()
-
-    def stop(self):
-        self._stop_evt.set()
-
-    def _status(self, text):
-        self.status_q.put(text)
-
-    def run(self):
-        while not self._stop_evt.is_set():
-            port = find_arduino_port()
-            if port is None:
-                self._status("아두이노 탐색 중... (연결되지 않음)")
-                self._stop_evt.wait(RECONNECT_INTERVAL_S)
-                continue
-
-            try:
-                ser = serial.Serial(port, BAUD, timeout=SERIAL_TIMEOUT_S)
-            except Exception as e:
-                self._status(f"{port} 연결 실패 ({e.__class__.__name__}) - {RECONNECT_INTERVAL_S:.0f}초 후 재시도")
-                self._stop_evt.wait(RECONNECT_INTERVAL_S)
-                continue
-
-            self._status(f"{port} 연결됨 - 데이터 대기 중")
-            last_data = time.monotonic()
-            try:
-                ser.reset_input_buffer()
-                while not self._stop_evt.is_set():
-                    raw = ser.readline()
-                    now = time.monotonic()
-                    if raw:
-                        line = raw.decode("utf-8", errors="ignore").strip()
-                        # '#' 줄은 아두이노쪽 경고/이벤트(MCP2515 실패, 기어·에러 변화 등)
-                        if line and not line.startswith("#"):
-                            sample = parse_line(line)
-                            if sample is not None:
-                                if now - last_data > 1.0:
-                                    self._status(f"{port} 수신 중")
-                                last_data = now
-                                self.data_q.put(sample)
-                    # USB가 뽑혀도 예외 없이 타임아웃만 반복되는 경우가 있어 워치독을 둔다
-                    if now - last_data > DATA_WATCHDOG_S:
-                        self._status(f"{port} 무응답 {DATA_WATCHDOG_S:.0f}초 - 재연결")
-                        break
-            except Exception:
-                self._status(f"{port} 연결 끊김 - {RECONNECT_INTERVAL_S:.0f}초 후 재연결")
-            finally:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-
-            if not self._stop_evt.is_set():
-                self._stop_evt.wait(RECONNECT_INTERVAL_S)
-
-
-# ====================== 기록 ======================
-
-def next_csv_path(base_dir):
-    """canlog_001.csv ... canlog_999.csv -> canlog_000.csv -> canlog_001.csv(덮어쓰기) 순환."""
-    pat = re.compile(r"^" + re.escape(FILE_PREFIX) + r"(\d{3})\.csv$", re.IGNORECASE)
-    found = []
+def _opt_float(raw, key):
+    """공란/누락/비숫자면 None. 온도처럼 '있을 수도 없을 수도' 있는 열에 쓴다."""
+    text = (raw.get(key) or "").strip()
+    if not text:
+        return None
     try:
-        for name in os.listdir(base_dir):
-            m = pat.match(name)
-            full = os.path.join(base_dir, name)
-            if m and os.path.isfile(full):
-                found.append((os.path.getmtime(full), int(m.group(1))))
-    except OSError:
-        pass
-
-    if not found:
-        n = 1
-    else:
-        found.sort()                      # 번호가 순환하므로 '가장 최근에 쓴 파일' 기준으로 잇는다
-        n = (found[-1][1] + 1) % 1000
-    return os.path.join(base_dir, f"{FILE_PREFIX}{n:03d}.csv")
-
-
-class Recorder:
-    """CANLOG 16열 양식으로 CSV를 쓰고, 표시용 누적값(전력량 등)을 함께 계산한다.
-
-    파생값(배터리%/전력량)은 CSV에 넣지 않는다 — 아두이노 SD 출력과 양식을
-    똑같이 유지해야 하므로. 나중에 읽을 때 compute_derived()로 다시 구한다.
-    """
-
-    def __init__(self, csv_path):
-        self.csv_path = csv_path
-        # 요약은 CSV 옆에 같은 이름으로 (canlog_001.csv -> canlog_001_summary.txt)
-        self.summary_path = os.path.splitext(csv_path)[0] + "_summary.txt"
-        self._f = open(self.csv_path, "w", newline="", encoding="utf-8")
-        self._w = csv.writer(self._f)
-        self._w.writerow(CSV_HEADER)
-
-        self.t0 = time.monotonic()
-        self.wall_start = time.time()
-        self._last_t = None
-
-        self.n = 0
-        self.energy_wh = 0.0       # 순 소비량 (회생분이 차감된 값)
-        self.discharge_wh = 0.0
-        self.regen_wh = 0.0
-        self.start_v = None
-        self.last_v = None
-        self.start_pct = None
-        self.last_pct = None
-        self.peak_rpm = 0
-        self.peak_phase_a = 0.0
-        self.peak_batt_a = 0.0
-
-    def add(self, speed_div10, batt_v, batt_a, phase_a, gear):
-        now = time.monotonic()
-        t = now - self.t0
-        dt = 0.0 if self._last_t is None else (now - self._last_t)
-        if dt > DT_GAP_MAX_LIVE:   # 끊겼다 붙은 구간을 전력량에 통째로 넣지 않는다
-            dt = 0.0
-        self._last_t = now
-
-        rpm = speed_div10 * 10
-        power_w = batt_v * batt_a          # 전력량은 버스(배터리) 전류 기준. 상전류로는 계산 불가
-        wh = power_w * dt / 3600.0
-        self.energy_wh += wh
-        if wh >= 0.0:
-            self.discharge_wh += wh
-        else:
-            self.regen_wh += -wh
-
-        pct = batt_pct(batt_v)
-
-        self.n += 1
-        if self.start_v is None:
-            self.start_v, self.start_pct = batt_v, pct
-        self.last_v, self.last_pct = batt_v, pct
-        self.peak_rpm = max(self.peak_rpm, rpm)
-        self.peak_phase_a = max(self.peak_phase_a, abs(phase_a))
-        self.peak_batt_a = max(self.peak_batt_a, abs(batt_a))
-
-        # 시리얼로 나오지 않는 열은 공란으로 둔다
-        row = {c: "" for c in CSV_HEADER}
-        row["millis"]           = int(round(t * 1000))   # 기록 시작 기준 경과 ms
-        row["batteryVoltage_V"] = f"{batt_v:.1f}"
-        row["batteryCurrent_A"] = f"{batt_a:.1f}"
-        row["phaseCurrent_A"]   = f"{phase_a:.1f}"
-        row["motorSpeed_rpm"]   = rpm
-        row["gear"]             = GEAR_NAMES.get(gear, "UNKNOWN")
-        self._w.writerow([row[c] for c in CSV_HEADER])
-        self._f.flush()   # 전원이 갑자기 끊겨도 마지막 줄까지 남도록 (SD 로거와 같은 이유)
-
-    def elapsed(self):
-        return time.monotonic() - self.t0
-
-    def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
-        self._write_summary()
-
-    def _write_summary(self):
-        def fmt(v, nd=1):
-            return "-" if v is None else f"{round(v, nd)}"
-
-        lines = [
-            "y_can 기록 요약",
-            "=" * 46,
-            f"CSV         : {os.path.basename(self.csv_path)}",
-            f"시작        : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.wall_start))}",
-            f"기록 시간   : {self.elapsed():.1f} 초",
-            f"샘플 수     : {self.n}",
-            "",
-            "--- 배터리 ---",
-            f"시작 전압   : {fmt(self.start_v)} V",
-            f"종료 전압   : {fmt(self.last_v)} V",
-            f"시작 잔량   : {fmt(self.start_pct)} %",
-            f"종료 잔량   : {fmt(self.last_pct)} %",
-            f"(환산 기준  : 만충 {BATT_V_FULL} V / 방전종지 {BATT_V_EMPTY} V)",
-            "",
-            "--- 전력량 (배터리전압 x 버스전류 적분) ---",
-            f"총 사용량   : {self.energy_wh:.2f} Wh",
-            f"  방전      : {self.discharge_wh:.2f} Wh",
-            f"  회생      : {self.regen_wh:.2f} Wh",
-            "",
-            "--- 피크 ---",
-            f"최대 RPM    : {self.peak_rpm}",
-            f"최대 상전류 : {self.peak_phase_a:.1f} A",
-            f"최대 버스전류: {self.peak_batt_a:.1f} A",
-            "",
-            "※ CSV는 CANLOG 16열 양식이며, 시리얼로 나오지 않는 열(온도/에러비트/",
-            "   브레이크/모드/컨택터/가속페달/lifeCounter)은 공란이다.",
-            "   SD카드에서 뽑은 CSV에는 그 열들도 채워져 있다.",
-        ]
-        try:
-            with open(self.summary_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-        except OSError:
-            pass
+        return float(text)
+    except ValueError:
+        return None
 
 
 # ====================== CSV 읽기 + 파생값 계산 ======================
 
 def load_canlog(path):
-    """CANLOG 16열 CSV를 읽어 (rows, 오류메시지) 반환.
-
-    아두이노 SD 출력과 PC 기록 출력이 같은 양식이라 둘 다 그대로 처리된다.
-    PC 출력의 공란 열은 애초에 읽지 않으므로 문제되지 않는다.
-    """
+    """CANLOG 16열 CSV를 읽어 (rows, 오류메시지) 반환."""
     if not path or not os.path.isfile(path):
         return None, "파일을 찾을 수 없습니다."
 
@@ -381,6 +105,8 @@ def load_canlog(path):
                     continue    # 공란이거나, 기록 중 전원이 끊겨 잘린 마지막 줄
                 rows.append({"millis": ms, "volt": volt, "amp": amp,
                              "phase": ph, "rpm": rpm,
+                             "motor_temp": _opt_float(raw, COL_MOTOR_TEMP),
+                             "ctrl_temp": _opt_float(raw, COL_CTRL_TEMP),
                              "gear": (raw.get("gear") or "").strip()})
     except OSError as e:
         return None, f"파일을 열 수 없습니다.\n{e}"
@@ -390,11 +116,17 @@ def load_canlog(path):
     return rows, None
 
 
+def _mean(values):
+    """None을 뺀 평균. 남은 표본이 없으면 None."""
+    nums = [v for v in values if v is not None]
+    return sum(nums) / len(nums) if nums else None
+
+
 def compute_derived(rows):
     """millis 간격으로 전력량을 적분하고 각 행에 t_s/power_w/energy_wh/batt_pct를 채운다.
 
-    파생값을 CSV에 저장하지 않는 대신 읽을 때마다 여기서 만든다.
-    시간축은 첫 줄을 0으로 맞춘다 — 아두이노 millis는 부팅 후 경과라 1048처럼 시작한다.
+    파생값은 CSV에 없으므로 읽을 때마다 여기서 만든다.
+    시간축은 첫 줄을 0으로 맞춘다 - 아두이노 millis는 부팅 후 경과라 1048처럼 시작한다.
     """
     t0 = rows[0]["millis"]
     energy = discharge = regen = 0.0
@@ -435,6 +167,9 @@ def compute_derived(rows):
         "peak_rpm": peak_rpm,
         "peak_phase_a": peak_phase,
         "peak_batt_a": peak_amp,
+        # 온도는 SD 로그에만 있다. 없으면 None이고 화면에서 '—'로 표시된다
+        "motor_temp_avg": _mean([r["motor_temp"] for r in rows]),
+        "ctrl_temp_avg": _mean([r["ctrl_temp"] for r in rows]),
     }
 
 
@@ -443,24 +178,15 @@ def compute_derived(rows):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("y_can - CAN 텔레메트리 대시보드")
-        root.geometry("940x430")
-        root.minsize(820, 400)
+        root.title("y_can - CAN 로그 뷰어")
+        root.geometry("940x300")
+        root.minsize(820, 280)
 
-        self.data_q = queue.Queue()
-        self.status_q = queue.Queue()
-        self.worker = SerialWorker(self.data_q, self.status_q)
-
-        self.recorder = None        # 기록 중이면 Recorder 인스턴스
-        self.record_csv = None      # 이번 세션에서 기록한(하는) CSV 경로
-        self.loaded_csv = None      # 시작할 때 불러온 이전 CSV 경로
-        self.pct_buf = collections.deque(maxlen=PCT_SMOOTH_N)
+        self.loaded_csv = None      # 현재 불러온 CSV 경로
 
         self._build_ui()
-        self.worker.start()
         root.protocol("WM_DELETE_WINDOW", self.on_quit)
-        root.after(TICK_MS, self._tick)
-        root.after(250, self._startup_file_prompt)   # 창이 그려진 뒤에 띄운다
+        root.after(250, self.on_load)   # 창이 그려진 뒤에 파일 선택을 띄운다
 
     # ---------- UI 구성 ----------
 
@@ -468,35 +194,28 @@ class App:
         pad = 10
         head_font = ("Malgun Gothic", 12, "bold")
 
-        ttk.Label(self.root, text="실시간 대시보드", font=head_font).pack(anchor="w", padx=pad, pady=(pad, 2))
-        dash = ttk.Frame(self.root)
-        dash.pack(fill=tk.X, padx=pad)
-        self.v_speed = self._cell(dash, 0, "모터속도", "rpm")
-        self.v_volt  = self._cell(dash, 1, "배터리 전압", "V")
-        self.v_amp   = self._cell(dash, 2, "배터리 전류", "A")
-        self.v_phase = self._cell(dash, 3, "상전류", "A")
-
-        ttk.Label(self.root, text="상태", font=head_font).pack(anchor="w", padx=pad, pady=(pad, 2))
+        ttk.Label(self.root, text="불러온 로그 요약", font=head_font).pack(
+            anchor="w", padx=pad, pady=(pad, 2))
         stat = ttk.Frame(self.root)
         stat.pack(fill=tk.X, padx=pad)
-        self.v_pct    = self._cell(stat, 0, "[1] 배터리 잔량", "%")
-        self.v_energy = self._cell(stat, 1, "[2] 총 사용 전력량", "Wh")
-        self.v_slot3  = self._cell(stat, 2, "[3]", "")
-        self.v_slot4  = self._cell(stat, 3, "[4]", "")
+        self.v_pct        = self._cell(stat, 0, "[1] 배터리 잔량", "%")
+        self.v_energy     = self._cell(stat, 1, "[2] 총 사용 전력량", "Wh")
+        self.v_motor_temp = self._cell(stat, 2, "[3] 모터 평균온도", "°C")
+        self.v_ctrl_temp  = self._cell(stat, 3, "[4] 컨트롤러 평균온도", "°C")
 
         btns = ttk.Frame(self.root)
         btns.pack(fill=tk.X, padx=pad, pady=(pad + 4, 4))
-        self.btn_rec = ttk.Button(btns, text="기록 시작", width=18, command=self.on_toggle_record)
-        self.btn_rec.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btns, text="시각화", width=14, command=self.on_visualize).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="프로그램 종료", width=14, command=self.on_quit).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="불러오기", width=18, command=self.on_load).pack(
+            side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="시각화", width=14, command=self.on_visualize).pack(
+            side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="프로그램 종료", width=14, command=self.on_quit).pack(
+            side=tk.LEFT, padx=6)
 
-        self.conn_status = tk.StringVar(value="아두이노 탐색 중...")
-        self.rec_status = tk.StringVar(value="대기 중")
+        self.status = tk.StringVar(value="불러온 파일 없음")
         bar = ttk.Frame(self.root)
         bar.pack(fill=tk.X, side=tk.BOTTOM, padx=pad, pady=(0, 6))
-        ttk.Label(bar, textvariable=self.conn_status, foreground="#555").pack(side=tk.LEFT)
-        ttk.Label(bar, textvariable=self.rec_status, foreground="#555").pack(side=tk.RIGHT)
+        ttk.Label(bar, textvariable=self.status, foreground="#555").pack(side=tk.LEFT)
 
     def _cell(self, parent, col, title, unit):
         var = tk.StringVar(value="—")
@@ -508,135 +227,56 @@ class App:
                   anchor="center").pack(fill=tk.BOTH, expand=True, padx=6, pady=8)
         return var
 
-    # ---------- 시작 시 이전 CSV 불러오기 ----------
+    # ---------- 불러오기 ----------
 
-    def _startup_file_prompt(self):
+    def on_load(self):
         path = filedialog.askopenfilename(
-            title="이전 데이터 CSV 파일 선택 (취소하면 비운 채로 시작)",
+            title="CAN 로그 CSV 선택 (SD카드의 1.csv, 2.csv ...)",
             initialdir=BASE_DIR,
             filetypes=[("CSV 파일", "*.csv")],
             defaultextension=".csv")
         if not path:
-            self.rec_status.set("대기 중 (이전 데이터 없음)")
+            if self.loaded_csv is None:
+                self.status.set("불러온 파일 없음")
             return
 
         rows, err = load_canlog(path)
         if rows is None:
             messagebox.showwarning("불러오기", f"{os.path.basename(path)}\n\n{err}")
-            self.rec_status.set("대기 중 (불러오기 실패)")
+            if self.loaded_csv is None:
+                self.status.set("불러오기 실패")
             return
 
         summary = compute_derived(rows)
         self.loaded_csv = path
         self._show_summary(summary)
-        self.rec_status.set(f"불러옴: {os.path.basename(path)} "
-                            f"({summary['n']}샘플 / {summary['duration']:.0f}초)")
+
+        note = "" if summary["motor_temp_avg"] is not None or \
+                     summary["ctrl_temp_avg"] is not None else "  (온도 열 없음)"
+        self.status.set(f"불러옴: {os.path.basename(path)} "
+                        f"({summary['n']}샘플 / {summary['duration']:.0f}초){note}")
 
     def _show_summary(self, s):
+        def temp(v):
+            return "—" if v is None else f"{v:.1f}"
+
         self.v_pct.set(f"{s['pct']:.1f}")
         self.v_energy.set(f"{s['energy_wh']:.1f}")
+        self.v_motor_temp.set(temp(s["motor_temp_avg"]))
+        self.v_ctrl_temp.set(temp(s["ctrl_temp_avg"]))
 
-    # ---------- 주기 갱신 ----------
-
-    def _tick(self):
-        while True:
-            try:
-                self.conn_status.set(self.status_q.get_nowait())
-            except queue.Empty:
-                break
-
-        latest = None
-        while True:
-            try:
-                sample = self.data_q.get_nowait()
-            except queue.Empty:
-                break
-            latest = sample
-            if self.recorder is not None:
-                self.recorder.add(*sample)
-
-        if latest is not None:
-            self._update_dashboard(latest)
-
-        if self.recorder is not None:
-            self._update_live_status()
-
-        self.root.after(TICK_MS, self._tick)
-
-    def _update_dashboard(self, sample):
-        speed_div10, batt_v, batt_a, phase_a, gear = sample
-        self.v_speed.set(f"{speed_div10 * 10}")     # 아두이노가 10으로 나눠 보내므로 되돌린다
-        self.v_volt.set(f"{batt_v:.1f}")
-        self.v_amp.set(f"{batt_a:.1f}")
-        self.v_phase.set(f"{phase_a:.1f}")
-        self.pct_buf.append(batt_pct(batt_v))
-
-    def _update_live_status(self):
-        if self.pct_buf:
-            self.v_pct.set(f"{sum(self.pct_buf) / len(self.pct_buf):.1f}")
-        self.v_energy.set(f"{self.recorder.energy_wh:.1f}")
-        self.rec_status.set(f"● 기록 중 {os.path.basename(self.record_csv)} "
-                            f"| {self.recorder.elapsed():.0f}초 | {self.recorder.n}샘플")
-
-    # ---------- 버튼 ----------
-
-    def on_toggle_record(self):
-        if self.recorder is None:
-            self._start_record()
-        else:
-            self._stop_record()
-
-    def _start_record(self):
-        path = next_csv_path(BASE_DIR)
-        try:
-            recorder = Recorder(path)
-        except OSError as e:
-            messagebox.showerror("기록 시작 실패", f"{path}\n{e}")
-            return
-
-        self.recorder = recorder
-        self.record_csv = recorder.csv_path
-        self.pct_buf.clear()
-
-        # 이전에 불러와 띄워둔 값은 지운다 (디스크의 데이터는 그대로 남는다)
-        self.v_pct.set("—")
-        self.v_energy.set("—")
-
-        self.btn_rec.config(text="기록 중지")
-        self.rec_status.set(f"● 기록 중 {os.path.basename(path)}")
-
-    def _stop_record(self):
-        rec = self.recorder
-        self.recorder = None
-        rec.close()
-        self.btn_rec.config(text="기록 시작")
-        tag = os.path.basename(rec.csv_path)
-
-        if rec.n == 0:
-            self.v_pct.set("—")
-            self.v_energy.set("—")
-            self.rec_status.set(f"기록 종료 - 수신 데이터 없음 ({tag})")
-            return
-
-        self.v_pct.set(f"{rec.last_pct:.1f}")
-        self.v_energy.set(f"{rec.energy_wh:.1f}")
-        self.rec_status.set(f"기록 종료: {tag} | {rec.elapsed():.0f}초 | {rec.n}샘플")
-
-    def _viz_target(self):
-        """이번 세션 기록이 우선, 없으면 시작할 때 불러온 CSV."""
-        return self.record_csv or self.loaded_csv
+    # ---------- 시각화 ----------
 
     def on_visualize(self):
-        path = self._viz_target()
-        if path is None:
+        if self.loaded_csv is None:
             messagebox.showinfo("시각화", "표시할 데이터가 없습니다.\n"
-                                          "기록을 하거나, 프로그램을 다시 켜서 이전 CSV를 선택하세요.")
+                                          "먼저 '불러오기'로 CSV를 선택하세요.")
             return
 
-        # 파일을 먼저 읽고 나서 파생값을 계산한다 (CSV에는 원시 열만 들어 있다)
-        rows, err = load_canlog(path)
+        # 파일을 다시 읽고 나서 파생값을 계산한다 (CSV에는 원시 열만 들어 있다)
+        rows, err = load_canlog(self.loaded_csv)
         if rows is None:
-            messagebox.showerror("시각화", f"{os.path.basename(path)}\n\n{err}")
+            messagebox.showerror("시각화", f"{os.path.basename(self.loaded_csv)}\n\n{err}")
             return
         if len(rows) < 2:
             messagebox.showinfo("시각화", "그래프를 그리기에 데이터가 부족합니다.")
@@ -644,7 +284,7 @@ class App:
         compute_derived(rows)
 
         try:
-            self._draw_all(path, rows)
+            self._draw_all(self.loaded_csv, rows)
         except ImportError:
             messagebox.showerror("시각화", "matplotlib이 설치되어 있지 않습니다.\n"
                                            "pip install matplotlib")
@@ -652,13 +292,7 @@ class App:
             messagebox.showerror("시각화", f"그래프 생성 중 오류\n{e}")
 
     def on_quit(self):
-        if self.recorder is not None:
-            # 기록 중 종료 = 데이터 유실이므로, 정상 마감(요약 파일까지)하고 닫는다
-            self._stop_record()
-        self.worker.stop()
         self.root.destroy()
-
-    # ---------- 시각화 ----------
 
     def _draw_all(self, path, rows):
         import matplotlib
@@ -681,6 +315,14 @@ class App:
         power   = [r["power_w"] for r in rows]
         rpm     = [r["rpm"] for r in rows]
 
+        # 온도는 공란인 줄이 섞일 수 있으므로 값이 있는 표본만 시간과 짝지어 모은다
+        def temp_series(key):
+            pairs = [(r["t_s"], r[key]) for r in rows if r[key] is not None]
+            return [p[0] for p in pairs], [p[1] for p in pairs]
+
+        t_motor, motor_temp = temp_series("motor_temp")
+        t_ctrl,  ctrl_temp  = temp_series("ctrl_temp")
+
         def plot_pct(ax):
             ax.plot(t, pct, color="tab:green")
             ax.set_ylim(0, 100)
@@ -695,7 +337,7 @@ class App:
             ax.axhline(0, color="#999", lw=0.8)
             ax.set_xlabel("시간 (초)")
             ax.set_ylabel("전류 (A)")
-            ax.set_title(f"실시간 버스전류와 상전류  [{tag}]")
+            ax.set_title(f"시간별 버스전류와 상전류  [{tag}]")
             ax.legend()
             ax.grid(True, alpha=0.3)
 
@@ -704,7 +346,7 @@ class App:
             ax.axhline(0, color="#999", lw=0.8)
             ax.set_xlabel("시간 (초)")
             ax.set_ylabel("소모전력 (W)")
-            ax.set_title(f"실시간 소모전력 (배터리전압 x 버스전류)  [{tag}]")
+            ax.set_title(f"시간별 소모전력 (배터리전압 x 버스전류)  [{tag}]")
             ax.grid(True, alpha=0.3)
 
         def plot_rpm(ax):
@@ -714,12 +356,31 @@ class App:
             ax.set_title(f"시간별 RPM  [{tag}]")
             ax.grid(True, alpha=0.3)
 
-        for i, (title, fn) in enumerate([
+        def plot_temps(ax):
+            # 둘 중 하나만 기록돼 있으면 그것만 그린다
+            if motor_temp:
+                ax.plot(t_motor, motor_temp, color="tab:red", label="모터 온도")
+            if ctrl_temp:
+                ax.plot(t_ctrl, ctrl_temp, color="tab:blue", label="컨트롤러 온도")
+            ax.set_xlabel("시간 (초)")
+            ax.set_ylabel("온도 (°C)")
+            ax.set_title(f"시간별 모터·컨트롤러 온도  [{tag}]")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plots = [
             ("시간별 배터리 퍼센트", plot_pct),
-            ("실시간 버스전류와 상전류", plot_currents),
-            ("실시간 소모전력", plot_power),
+            ("시간별 버스전류와 상전류", plot_currents),
+            ("시간별 소모전력", plot_power),
             ("시간별 RPM", plot_rpm),
-        ]):
+        ]
+        if motor_temp or ctrl_temp:
+            plots.append(("시간별 모터·컨트롤러 온도", plot_temps))
+        else:
+            # PC가 시리얼로 받아 쓴 예전 CSV에는 온도 열이 비어 있다
+            self.status.set(f"불러옴: {tag}  (온도 열이 비어 있어 온도 그래프는 생략)")
+
+        for i, (title, fn) in enumerate(plots):
             self._plot_window(f"{title} - {tag}", fn, offset=i * 30)
 
     def _plot_window(self, title, draw_fn, offset=0):
