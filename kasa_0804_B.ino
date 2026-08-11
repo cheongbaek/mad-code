@@ -179,8 +179,8 @@ const int STEER_ANGLE_MAX =  40;
 const int STEER_ANGLE_MIN = -STEER_ANGLE_MAX;
 
 // ================= [0731-3] 실측 좌/우 하드 리밋 (raw, 0~1023) =================
-const int RAW_LEFT_LIMIT  = 576;   // 왼쪽 끝 (하드 리밋)
-const int RAW_RIGHT_LIMIT = 362;   // 오른쪽 끝 (하드 리밋)
+const int RAW_LEFT_LIMIT  = 618;   // 왼쪽 끝 (하드 리밋)
+const int RAW_RIGHT_LIMIT = 328;   // 오른쪽 끝 (하드 리밋)
 
 // ================= 조향 안전 여유값 =================
 const int SAFETY_MARGIN = 10;   // 하드 리밋에서 안쪽으로 두는 여유(raw 카운트)
