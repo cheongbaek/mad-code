@@ -14,7 +14,12 @@ MCP_CAN CAN0(CAN_CS);
 // =====================================================================
 
 unsigned long lastPrint = 0;
-const char* LOG_FILENAME = "canlog.csv";
+
+// 로그 파일명은 1.csv, 2.csv, ... 로 부팅마다 하나씩 올라간다.
+// 아두이노에는 시계가 없어 날짜·시각으로 이름을 지을 수 없으므로 번호로 구분한다.
+const unsigned int LOG_MAX_INDEX = 999;   // 이 개수를 넘으면 마지막 번호를 재사용
+char logName[13];                         // "999.csv" + NUL (SD는 8.3 이름만 확실히 먹는다)
+
 File logFile;
 bool sdReady = false;
 
@@ -49,6 +54,7 @@ bool lastBrake = false, lastDcContactor = false;
 
 void printSnapshot();
 void logToSD();
+void pickLogName();
 void printErrors(byte e1, byte e2, byte e3);
 const char* gearName(byte g);
 const char* opModeName(byte m);
@@ -83,19 +89,20 @@ void setup()
   if (SD.begin(SD_CS))
   {
     sdReady = true;
-    bool needHeader = !SD.exists(LOG_FILENAME);
+    pickLogName();   // 부팅마다 안 쓰인 새 번호. 한 파일에 이어붙이면 재부팅 때
+                     // millis가 0으로 되돌아가 시간축이 뒤로 점프한다
 
-    logFile = SD.open(LOG_FILENAME, FILE_WRITE);
+    logFile = SD.open(logName, FILE_WRITE);
     if (logFile)
     {
-      if (needHeader)
-      {
-        logFile.println("millis,batteryVoltage_V,batteryCurrent_A,phaseCurrent_A,motorSpeed_rpm,"
-                         "controllerTemp_C,motorTemp_C,accelPct,gear,brake,opMode,dcContactor,"
-                         "err1_hex,err2_hex,err3_hex,lifeCounter");
-        logFile.flush();
-      }
-      Serial.println("SD Card Initialization Success. Logging to canlog.csv");
+      // 항상 새 파일이므로 헤더는 무조건 쓴다
+      logFile.println("millis,batteryVoltage_V,batteryCurrent_A,phaseCurrent_A,motorSpeed_rpm,"
+                       "controllerTemp_C,motorTemp_C,accelPct,gear,brake,opMode,dcContactor,"
+                       "err1_hex,err2_hex,err3_hex,lifeCounter");
+      logFile.flush();
+
+      Serial.print("SD Card Initialization Success. Logging to ");
+      Serial.println(logName);
     }
     else
     {
@@ -187,6 +194,19 @@ void loop()
     printSnapshot();
     logToSD();
   }
+}
+
+// 안 쓰인 가장 낮은 번호를 고른다 (1.csv, 2.csv, ...).
+// LOG_MAX_INDEX개가 다 차면 마지막 번호를 지우고 재사용한다.
+void pickLogName()
+{
+  for (unsigned int i = 1; i <= LOG_MAX_INDEX; i++)
+  {
+    itoa(i, logName, 10);
+    strcat(logName, ".csv");
+    if (!SD.exists(logName)) return;
+  }
+  SD.remove(logName);   // 여기 오면 logName은 마지막 번호
 }
 
 void logToSD()
@@ -293,7 +313,16 @@ void printSnapshot()
   Serial.println(lifeCounter);
 
   Serial.print("SD Logging   : ");
-  Serial.println(sdReady ? "ON (canlog.csv)" : "OFF");
+  if (sdReady)
+  {
+    Serial.print("ON (");
+    Serial.print(logName);
+    Serial.println(")");
+  }
+  else
+  {
+    Serial.println("OFF");
+  }
 
   Serial.println("======================================");
 }
