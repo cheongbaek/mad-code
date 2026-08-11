@@ -32,7 +32,10 @@ unsigned long lastSd     = 0;
 
 File logFile;
 bool sdReady = false;
-char logName[13];      // 8.3 파일명 + NUL
+
+// 로그 파일명은 1.csv, 2.csv, ... 로 부팅마다 하나씩 올라간다
+const unsigned int LOG_MAX_INDEX = 999;   // 이 개수를 넘으면 마지막 번호를 재사용
+char logName[13];                         // "999.csv" + NUL (SD는 8.3 이름만 확실히 먹는다)
 
 // ---- Message I (0x180117EF) : Voltage / Current / Speed ----
 float battVoltage  = 0;
@@ -120,18 +123,18 @@ void setup()
   }
 }
 
-// 안 쓰인 가장 낮은 번호를 고른다. 99개가 다 차면 마지막 것을 지우고 재사용한다.
-// snprintf 대신 자릿수를 직접 박는다 - SD는 8.3 이름만 확실히 먹고, 자리는 [6][7]로 고정이다.
+// 안 쓰인 가장 낮은 번호를 고른다 (1.csv, 2.csv, ...).
+// 아두이노에는 시계가 없어 날짜·시각으로 이름을 지을 수 없으므로 번호로 구분한다.
+// LOG_MAX_INDEX개가 다 차면 마지막 것을 지우고 재사용한다.
 void pickLogName()
 {
-  strcpy(logName, "CANLOG00.CSV");
-  for (byte i = 1; i <= 99; i++)
+  for (unsigned int i = 1; i <= LOG_MAX_INDEX; i++)
   {
-    logName[6] = '0' + (i / 10);
-    logName[7] = '0' + (i % 10);
+    itoa(i, logName, 10);
+    strcat(logName, ".csv");
     if (!SD.exists(logName)) return;
   }
-  SD.remove(logName);   // 여기 오면 logName은 CANLOG99.CSV
+  SD.remove(logName);   // 여기 오면 logName은 마지막 번호
 }
 
 void loop()
