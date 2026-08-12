@@ -147,7 +147,7 @@ const uint8_t ENC_B_PIN = 3;
 // --- E-stop (NC: 평상시 LOW, 개방 시 HIGH → e-stop) ---
 // [0804-5] 폴링으로만 판정한다 (PCINT 제거 — 발동에 500ms 확인을 두므로 즉시 감지가
 //   요구와 모순된다). 그래서 D13이 PB7/PCINT7 이라는 사실은 이제 쓰이지 않는다.
-const uint8_t ESTOP_PIN = 13;
+const uint8_t ESTOP_PIN = 12;
 const bool ESTOP_ENABLED = true;   // false로 두면 핀 e-stop 비활성
 
 // --- [0730-1] 주행모드 스위치 (단순 ON/OFF, D5 ── 스위치 ── GND) ---
@@ -179,8 +179,8 @@ const int STEER_ANGLE_MAX =  40;
 const int STEER_ANGLE_MIN = -STEER_ANGLE_MAX;
 
 // ================= [0731-3] 실측 좌/우 하드 리밋 (raw, 0~1023) =================
-const int RAW_LEFT_LIMIT  = 618;   // 왼쪽 끝 (하드 리밋)
-const int RAW_RIGHT_LIMIT = 328;   // 오른쪽 끝 (하드 리밋)
+const int RAW_LEFT_LIMIT  = 684;   // 왼쪽 끝 (하드 리밋)
+const int RAW_RIGHT_LIMIT = 394;   // 오른쪽 끝 (하드 리밋)
 
 // ================= 조향 안전 여유값 =================
 const int SAFETY_MARGIN = 10;   // 하드 리밋에서 안쪽으로 두는 여유(raw 카운트)

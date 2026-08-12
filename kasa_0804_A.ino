@@ -90,12 +90,12 @@ const uint8_t HALL_PIN_R = 21;   // 오른쪽 모터컨트롤러 펄스 (오른�
 
 // --- 인휠 주행 PWM ---
 const uint8_t PWM_PIN_L = 8;     // 왼쪽 모터 PWM (펄스 2와 같은 컨트롤러)
-const uint8_t PWM_PIN_R = 9;     // 오른쪽 모터 PWM (펄스 21과 같은 컨트롤러)
+const uint8_t PWM_PIN_R = 10;     // 오른쪽 모터 PWM (펄스 21과 같은 컨트롤러)
 
 // --- E-stop (NC: 평상시 LOW, 개방 시 HIGH → e-stop) ---
 // [0804-1] 폴링으로만 판정한다 (PCINT 제거 — 발동에 500ms 확인을 두므로 즉시 감지가
 //   요구와 모순된다). 그래서 D13이 PB7/PCINT7 이라는 사실은 이제 쓰이지 않는다.
-const uint8_t ESTOP_PIN = 13;
+const uint8_t ESTOP_PIN = 12;
 const bool ESTOP_ENABLED = true;   // false로 두면 핀 e-stop 비활성(배선 전 테스트용)
 
 // --- [0730-1] 쓰로틀(가속) 페달 가변저항 ---
