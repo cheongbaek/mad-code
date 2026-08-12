@@ -4,7 +4,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# y_can 기록 산출물 (스크립트 폴더에 평평하게 쌓인다)
+# 계측 CSV 는 종류를 가리지 않고 전부 제외한다 (gold 저장소와 같은 규칙)
+*.csv
+
+# y_can 기록 산출물 (스크립트 폴더에 평평하게 쌓인다) — 위 규칙이 못 잡는 대문자 포함
 canlog_*.csv
 canlog_*_summary.txt
 CANLOG*.CSV
