@@ -85,7 +85,7 @@
 
 // ================= 핀 정의 (여기서 조절) =================
 // --- 홀센서 (인터럽트 핀, XOR 합산신호) ---
-const uint8_t HALL_PIN_L = 2;    // 왼쪽 모터컨트롤러 펄스 (왼쪽 PID 피드백)
+const uint8_t HALL_PIN_L = 20;    // 왼쪽 모터컨트롤러 펄스 (왼쪽 PID 피드백)
 const uint8_t HALL_PIN_R = 21;   // 오른쪽 모터컨트롤러 펄스 (오른쪽 PID 피드백)
 
 // --- 인휠 주행 PWM ---
@@ -100,7 +100,7 @@ const bool ESTOP_ENABLED = true;   // false로 두면 핀 e-stop 비활성(배�
 
 // --- [0730-1] 쓰로틀(가속) 페달 가변저항 ---
 // 이 보드는 이 값으로 제어하지 않는다. 0~1023 raw를 텔레메트리로 보고만 한다.
-const uint8_t THROTTLE_PIN = A1;
+const uint8_t THROTTLE_PIN = A0;
 
 
 // ================= 통신 =================
