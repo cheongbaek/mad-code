@@ -85,8 +85,8 @@
 
 // ================= 핀 정의 (여기서 조절) =================
 // --- 홀센서 (인터럽트 핀, XOR 합산신호) ---
-const uint8_t HALL_PIN_L = 20;    // 왼쪽 모터컨트롤러 펄스 (왼쪽 PID 피드백)
-const uint8_t HALL_PIN_R = 21;   // 오른쪽 모터컨트롤러 펄스 (오른쪽 PID 피드백)
+const uint8_t HALL_PIN_L = 21;    // 왼쪽 모터컨트롤러 펄스 (왼쪽 PID 피드백)
+const uint8_t HALL_PIN_R = 20;   // 오른쪽 모터컨트롤러 펄스 (오른쪽 PID 피드백)
 
 // --- 인휠 주행 PWM ---
 const uint8_t PWM_PIN_L = 8;     // 왼쪽 모터 PWM (펄스 2와 같은 컨트롤러)
