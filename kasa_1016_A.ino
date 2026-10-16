@@ -1,0 +1,813 @@
+// ============================================================
+//  A보드 : 인휠모터 좌우 독립 PID + 쓰로틀 페달 계측 (Arduino Mega 2560) - 1016 버전
+//  kasa_0904_A.ino 기반. 제어 로직(PID·FF·블랭킹·중앙값·워치독·핸드셰이크)은 한 줄도 바꾸지 않았다.
+//
+// ════════════════════════════════════════════════════════════════════════════
+//  ★★ [1016-A1] E-stop 감지 로직을 ★완전히 걷어냈다★ (사용자 지시) ★★
+// ════════════════════════════════════════════════════════════════════════════
+//      0904 부터 ESTOP_ENABLED = false 로 꺼 두었던 판정 코드(D12 폴링·확인 타이머·applyEstop·
+//      "STOP" 출력·E-stop 중 명령 무시)를 지웠다. ★이 보드는 D12 를 읽지 않고 "STOP" 을 내지 않는다★.
+//      차량 E-stop 은 B보드(kasa_1016_B)가 판정하고, 상위(nxde/arduino.py)가 B 텔레메트리 상태 2 를 보면
+//      이 보드에 ★쓰로틀 0★ 을 보낸다(B 상태 1 = 제동등 조건일 때도 0). 이 보드가 하는 일은 그 명령을 따르는 것뿐이다.
+//      ⚠️ 그래서 상위가 죽으면 E-stop 으로 이 보드가 서지 않는다 — 그때는 무입력 워치독(RX_TIMEOUT_MS 3초)이 세운다.
+//
+//  ★★ [1016-A2] 쓰로틀 페달 가변저항 = ★A15★ (사용자 확인 — 0904 의 A0 에서 옮겼다) ★★
+//
+//  ── 아래 [0904-1]·[0904-2] 의 E-stop 이야기는 ★기록으로만★ 남긴다 — 1016 에는 해당 코드가 없다 ──
+//
+// ════════════════════════════════════════════════════════════════════════════
+//  ★★ [0904-1] E-stop 확인시간 500ms → ★100ms★ (발동·해제 대칭은 그대로) ★★
+// ════════════════════════════════════════════════════════════════════════════
+//      발동 : 100ms 연속 개방(HIGH) / 해제 : 100ms 연속 단락(LOW).
+//      B보드(kasa_0904_B.ino)도 같은 값으로 함께 바뀌었다 — 두 보드의 규약은 늘 같다.
+//
+//      [왜 줄이는가] 0804 의 500ms 는 '주행 중 오발동이 더 위험하다'는 판단으로 둔
+//        값이었다. 그 대가가 ★비상정지가 최대 0.5초 늦는 것★ 인데, 실제로 밟히기까지
+//        차가 가는 거리가 저속에서도 1m 를 넘었다. 접점 채터링은 100ms 로도 충분히
+//        걸러지므로(채터링은 수 ms 단위다), 확인 시간을 노이즈를 막는 최소치까지
+//        낮추고 정지 지연을 그만큼 되돌린다.
+//
+//      ★ 늦는 거리 (100ms 기준) ★
+//            2.65 m/s ( 9.5km/h, 3펄스) → 약 0.27 m
+//            4.42 m/s (15.9km/h, 5펄스) → 약 0.44 m
+//           13.26 m/s (47.7km/h,15펄스) → 약 1.33 m
+//        ※ 물리적 최후 수단은 여전히 별개로 있어야 한다 — 이 핀은 '소프트웨어 비상정지'다.
+//
+//      [구현] 판정은 loop 의 digitalRead 폴링(updateEstop)만으로 한다. 0731 에 있던
+//        핀체인지 인터럽트(PCINT)는 0804 에서 제거했고 되살리지 않았다 — 확인 시간을
+//        두는 이상 '개방을 본 즉시 끊는' ISR 은 요구와 모순되고, 남겨두면 확인시간
+//        미만의 노이즈에서 인휠 PWM 만 순간 끊겨(램프업 리셋) 주행이 거칠어진다.
+//        loop 는 수 kHz 로 돌아 100ms 판정에도 해상도가 충분히 남는다.
+//
+// ════════════════════════════════════════════════════════════════════════════
+//  ★★ [0904-2] 이 보드의 E-stop 은 ★꺼져 있다★ (ESTOP_ENABLED = false) ★★
+// ════════════════════════════════════════════════════════════════════════════
+//      ★차량의 E-stop 이 없어진 것이 아니다★ D12 NC 라인은 A·B 두 보드에 병렬로
+//      물려 있고, ★B보드(kasa_0904_B.ino)가 ESTOP_ENABLED = true 로 그대로 감지한다★.
+//      B보드가 발동하면 조향 힘빼기 + 리니어 2단(풀브레이킹)이 걸리고, 상위
+//      (nxde/arduino.py update_estop)가 B보드의 "STOP" 한 줄을 보고 A보드로 정지값을
+//      보낸다. 즉 제동과 구동차단은 그대로 살아 있다.
+//
+//      [왜 A보드만 끄는가]
+//        ① 같은 한 라인을 두 보드가 각자 판정하면 ★같은 사건에 두 개의 판정 시각★ 이
+//           생긴다. 한쪽만 발동한 동안 텔레메트리가 갈려(S, 는 나오는데 STOP 도 나온다)
+//           상위 로그에서 원인을 읽기 어려웠다.
+//        ② A보드가 STOP 만 내보내는 동안에는 ★쓰로틀 raw(A0)도 함께 끊긴다★.
+//           그 값은 수동조종의 유일한 구동 입력이라, E-stop 을 푼 직후에도 페달이
+//           죽은 것처럼 보이는 구간이 생겼다.
+//        ③ 보드 식별에도 걸린다 — E-stop 중에는 'S,' 가 안 나와 arduino.py 의
+//           identify_port 가 A보드를 A 로 알아보지 못했다(DETECT_ESTOP_HOLD_S 참고).
+//           이 보드가 E-stop 을 보지 않으면 그 동안에도 계속 'S,' 를 내보내므로
+//           ★E-stop 이 걸린 채로도 A보드는 정상 식별된다★.
+//      ★되돌리려면 아래 ESTOP_ENABLED 를 true 로만 바꾸면 된다★ (판정 코드는 그대로다).
+//
+// ════════════════════════════════════════════════════════════════════════════
+//  ★★ [0904-3] 연결확인 핸드셰이크 : '-' 한 줄을 받으면 "YES" 한 줄 ★★
+// ════════════════════════════════════════════════════════════════════════════
+//      ▶ 왜 : 텔레메트리('S,...')가 나온다는 것은 ★보드→PC 한 방향★ 만 증명한다.
+//        PC→보드 방향은 아무것도 증명하지 못한다(TX 선이 빠져도, 포트를 다른
+//        프로세스가 물고 있어 write 가 먹히지 않아도 출력은 멀쩡히 보인다).
+//        그래서 상위(nxde/arduino.py identify_port, nxde/check.py)가 '-' 를 보내고
+//        "YES" 를 받아야 비로소 ★양방향★ 연결로 인정한다. 못 받으면 포트를 닫고
+//        다시 열어 처음부터 다시 확인한다.
+//      ▶ 동작 : '-' 한 줄(공백·다른 문자 없이)을 받으면 즉시 "YES" 를 한 번 찍고,
+//        그 뒤 HANDSHAKE_HOLD_MS(2000ms) 동안 ★평상시 텔레메트리를 내보내지 않는다★.
+//        상위가 "YES" 를 텔레메트리에 섞이지 않은 채로 확인할 수 있게 하기 위함이다.
+//        유예가 끝나면 아무 상태도 남기지 않고 원래대로 돌아간다.
+//      ▶ ★millis() 로만 센다 — delay() 를 쓰지 않는다★ 유예 중에도 제어주기(20ms)와
+//        E-stop 판정은 평소대로 돈다. 멈추는 것은 출력 한 줄뿐이다.
+//      ▶ ★E-stop 의 "STOP" 은 유예 중에도 나간다★ 상위가 그 문자열로 비상정지를
+//        판정하므로, 여기서 가리면 2초 동안 비상정지가 보이지 않는다.
+//        (이 보드는 [0904-2] 로 E-stop 을 끄고 있어 실제로는 나오지 않지만,
+//         ESTOP_ENABLED 를 true 로 되돌렸을 때를 위해 순서를 그렇게 두었다.)
+//      ▶ 구동에는 아무 영향이 없다 — 목표펄스도, 직접 PWM 도 건드리지 않는다.
+//
+//  --- 이하 구조는 0804(=0730) 과 동일 ---
+//  [0730-1] 쓰로틀 페달 입력(A0 → [1016-A2] A15) + 텔레메트리 4필드 "S,<좌펄스>,<우펄스>,<쓰로틀raw>"
+//      가속페달 가변저항을 A0으로 읽어 0~1023 raw로 보고만 한다(이 보드는 제어에 쓰지 않음).
+//      9샘플 중앙값만 적용(지연 ~1ms). 지수평활은 넣지 않았다.
+//
+//  [0730-2] ★★ 기동 노이즈 대책 : 기동 블랭킹(LAUNCH) + 3점 중앙값 필터 ★★
+//      (iw_0730_pid.ino에서 검증한 로직을 그대로 이식. 상세 배경은 그 파일 헤더 참고)
+//
+//      [문제] "코일에 힘은 들어갔는데 바퀴가 아직 안 도는" 구간에서 홀신호에 수백~1500
+//      단위 노이즈가 쏟아진다. 이 모터는 무부하 최대 1320RPM x 64펄스/회전(직결구동)이라
+//      20ms 창당 최대 ≈28.2펄스가 물리적 한계이므로 그 이상은 전부 허수다.
+//      기존 PID는 이 허수를 오차로 먹어 pwm을 0으로 클램프했고, 램프업이 통째로 리셋 →
+//      재램프 → 또 노이즈의 무한루프에 빠졌다.
+//
+//      [대책 1 : 기동 블랭킹] 정지 상태에서 목표가 0 → 양수로 바뀌면 LAUNCH 상태로
+//      들어가 그 구간 동안 피드백을 아예 보지 않는다(개루프).
+//        - pwm = FF(target)까지 PWM_SLEW_MAX(+4/cycle)로 램프. PID/코스트/폭주감지 정지
+//        - 종료 조건 : (a) 램프 완료 && (b) 정상 펄스 LAUNCH_SETTLE_CYCLES 연속,
+//          또는 LAUNCH_MAX_MS 타임아웃.  ★(a)가 없으면 노이즈가 오기도 전에 조기 종료★
+//      [대책 2 : 3점 중앙값] 주행 중 남는 단발성 스파이크 제거. 허수 판정된 값은 버퍼에
+//      아예 넣지 않아, 노이즈 주기에 '직전 정상값이 자동 대입'되는 효과가 난다.
+//
+//      ※ 텔레메트리 펄스 필드는 '필터 후 값'(PID가 실제로 본 값)을 보낸다.
+//
+//  --- 이하 구조는 0727 nodiff와 동일 ---
+//  좌우 차동은 이 보드에 없다. ROS2(gold_ws/src/nxde)가 담당한다:
+//     B보드 텔레메트리 "P,<조향각>,<A5원본>,<모드>"  ->  arduino.py 가 좌/우 펄스 계산
+//     ->  A보드로 "<좌펄스>,<우펄스>" 콤마 2값 전송  ->  A보드는 그대로 추종만
+//
+//  ★ 배선 (2026-08-13 실차 재확인 — 0730 이후 세 번 바뀌었다) ★
+//     왼쪽  모터 : 펄스 21 -> PID -> PWM 8
+//     오른쪽 모터 : 펄스 20 -> PID -> PWM 10
+//   좌/우 각각 '자기 바퀴의 펄스'로 '자기 바퀴의 PWM'을 닫는다 (교차 없음).
+//     ※ 0730 헤더에는 "왼쪽 펄스 2 / 오른쪽 펄스 21, PWM 8/9" 로 적혀 있었는데, 그 뒤
+//       ①왼쪽 홀센서 2→20, ②우측 PWM 9→10, ③홀센서 L/R 교체(20↔21) 세 번의 배선
+//       변경이 코드에만 반영되고 주석에는 남지 않았다. 여기서 실제 핀에 맞춘다.
+//
+//  입력 : "<값>" 또는 "<왼쪽값>,<오른쪽값>"  (부호 없는 정수, 개행 종료)
+//         - 단일 값: 펄스 전용(0~15), 범위 밖/숫자 아님은 무시 (좌우 동일값)
+//         - 콤마 2값: 좌/우 독립 — 0~15 펄스 / 16~255 직접 PWM / 256 이상 정지
+//         - ★"-" 한 줄 : 연결확인 핸드셰이크 ([0904-3]) — "YES" 를 한 번 돌려준다★
+//  ★[0904-4] 무입력 워치독 : 3초 동안 줄이 한 개도 안 오면 스스로 정지한다★
+//         RX_TIMEOUT_MS = 3000. 0713 에 제거했던 타임아웃을 되살린 것이다 —
+//         상위(PC)가 SIGKILL·터미널 종료·USB 단선·PC 정지로 말을 멈추면 종전에는
+//         ★마지막 명령을 영원히 물고 차가 계속 갔다★. 정상 종료(Ctrl+C)에만 있는
+//         정지값 전송(arduino.py stop_and_close)으로는 그 넷을 덮지 못한다.
+//         근거·설계는 RX_TIMEOUT_MS 선언부와 updateRxWatchdog() 주석에 적었다.
+//         ⚠️ 상위 nxde/arduino.py 의 KEEPALIVE_S(1.0s) 와 ★한 쌍★ 이다.
+//           그쪽을 늘리면 이 값도 늘려야 한다(셋 배 이상 유지).
+//  출력 : "S,<왼쪽펄스>,<오른쪽펄스>,<쓰로틀raw>" (평상시)
+//         "YES"  (핸드셰이크 응답, [0904-3])
+//  제어주기 : 20ms, 출력주기 : 50ms
+//  ★[1016-A1] E-stop 은 이 보드에 없다★ — D12 는 읽지 않는다(B보드가 판정, 상위가 쓰로틀 0 을 보낸다).
+// ============================================================
+
+
+// ================= 핀 정의 (여기서 조절) =================
+// --- 홀센서 (인터럽트 핀, XOR 합산신호) ---
+const uint8_t HALL_PIN_L = 21;   // 왼쪽 모터컨트롤러 펄스 (왼쪽 PID 피드백)
+const uint8_t HALL_PIN_R = 20;   // 오른쪽 모터컨트롤러 펄스 (오른쪽 PID 피드백)
+
+// --- 인휠 주행 PWM ---
+const uint8_t PWM_PIN_L = 8;     // 왼쪽 모터 PWM (펄스 21과 같은 컨트롤러)
+const uint8_t PWM_PIN_R = 10;    // 오른쪽 모터 PWM (펄스 20과 같은 컨트롤러)
+
+// --- [0730-1] 쓰로틀(가속) 페달 가변저항 ---
+// 이 보드는 이 값으로 제어하지 않는다. 0~1023 raw를 텔레메트리로 보고만 한다.
+const uint8_t THROTTLE_PIN = A15;   // ★[1016-A2] A0 → A15★
+
+
+// ================= 통신 =================
+const unsigned long BAUD = 115200;
+
+
+// ================= 공통 제어주기 =================
+const unsigned long CONTROL_WINDOW_MS = 20;
+
+
+// ================= [0730-1] 쓰로틀 필터 : 9샘플 중앙값 =================
+const uint8_t THROTTLE_MEDIAN_N = 9;   // 반드시 홀수
+int throttleRaw = 0;                   // 최근 중앙값 (0~1023, 텔레메트리용)
+
+
+// ================= ★ 인휠 FF 보간 테이블 (펄스 -> PWM, 실측으로 조절, 좌우 공통) ★ =================
+const int FF_TABLE_N = 12;
+const float ffPulseTable[FF_TABLE_N] = { 1.00,  2.00,  3.00,  4.00,  5.00,  6.50,  8.00, 10.09, 13.05, 16.05, 20.45, 24.00};
+const float ffPwmTable[FF_TABLE_N]   = {60,    70,    80,    90,    100,   110,   120,   130,   140,   150,   160,   170};
+
+// ================= ★ 인휠 PID 게인 (튜닝 지점, 좌[0]/우[1] 별도 관리) ★ =================
+float kp[2] = {0.4,  0.4};    // {왼쪽(펄스21-PWM8), 오른쪽(펄스20-PWM10)}
+float ki[2] = {0.03, 0.03};
+float kd[2] = {0.2,  0.2};
+
+// ================= ★ 값 해석 경계 ★ =================
+const int TARGET_MAX = 15;      // 0~15 = 펄스 목표. 단일 값 입력은 이 범위만 유효
+const int PWM_DIRECT_MAX = 255; // 16~255 = 직접 PWM (콤마 2값 형식에서만). 256 이상 = 정지
+
+// ================= ★ 인휠 코스트-캐치 (튜닝 지점) ★ =================
+const int CATCH_MARGIN = 1;   // 목표+이 값(펄스)에서 캐치
+
+// ================= ★ 인휠 PWM 상한 (튜닝 지점) ★ =================
+const int PWM_MAX = 170;
+
+// ================= ★ PWM 슬루레이트 제한 (튜닝 지점) ★ =================
+const int PWM_SLEW_MAX = 4;
+
+// 적분 누적을 오차가 작을 때(목표 근접 시)만 허용
+const int I_ACCUM_ERR_MAX = 4;
+
+// ================= ★ 폭주 감지 (튜닝 지점) ★ =================
+const int RUNAWAY_ERR_OVER = 2;
+const int RUNAWAY_CONFIRM_CYCLES = 50;   // 50주기 = 1초
+
+
+// ================= ★ [0730-2] 허수 펄스 판정 경계 (튜닝 지점) ★ =================
+const int PULSE_SANITY_MAX = 40;
+const int NOISE_HOLD_MAX_CYCLES = 50;   // 50주기 = 1초
+
+// ================= ★ [0730-2] 기동 블랭킹 LAUNCH (튜닝 지점) ★ =================
+const int LAUNCH_ENTRY_SPEED_MAX = 1;      // 이 펄스 이하일 때만 '정지 상태'로 보고 진입
+const int LAUNCH_SETTLE_CYCLES   = 5;      // 정상 펄스가 이만큼 연속되면 노이즈 종료로 판정
+const unsigned long LAUNCH_MAX_MS = 3000;  // 이 시간이 지나면 조건 불충족이어도 PID로 인계
+
+// ================= ★ [0730-2] 주행 중 3점 중앙값 필터 ★ =================
+const bool SPEED_MEDIAN_ON = true;
+const uint8_t SPEED_MEDIAN_N = 3;   // 3 고정 (median3 함수가 3점 전용)
+
+
+// ================= 좌/우 PID 상태 (완전 분리) =================
+const uint8_t LEFT  = 0;   // 왼쪽  : 펄스 21 피드백 -> PWM 8
+const uint8_t RIGHT = 1;   // 오른쪽 : 펄스 20 피드백 -> PWM 10
+
+float pidI[2]        = {0, 0};
+int   pidLastErr[2]  = {0, 0};
+bool  pidCoasting[2] = {false, false};
+int   pidLastPwm[2]  = {0, 0};
+int   runawayCnt[2]  = {0, 0};   // 폭주 판정용 연속 과속 주기 카운터
+int   noiseCnt[2]    = {0, 0};   // [0730-2] 연속 허수 펄스 주기 (블랭킹 중엔 세지 않음)
+
+// [0730-2] 기동 블랭킹 상태
+bool          launching[2] = {false, false};
+unsigned long launch_t[2]  = {0, 0};   // 블랭킹 진입 시각 (타임아웃용)
+int           settleCnt[2] = {0, 0};   // 정상 펄스 연속 주기 카운터
+
+// [0730-2] 중앙값 필터용 링버퍼 (정상 판정된 값만 들어간다)
+int     spdBuf[2][SPEED_MEDIAN_N] = {{0, 0, 0}, {0, 0, 0}};
+uint8_t spdPos[2] = {0, 0};
+
+
+// ================= 구동 모드 (좌/우 독립) =================
+const uint8_t DRIVE_PULSE = 0;   // 펄스 목표 PID 주행 (0~15)
+const uint8_t DRIVE_PWM   = 1;   // 직접 PWM 출력 (16~255, 무보호)
+
+uint8_t driveMode[2] = {DRIVE_PULSE, DRIVE_PULSE};
+int     pwmDirect[2] = {0, 0};   // 직접 PWM 모드에서 출력할 값
+
+
+// ================= 인휠 상태 =================
+volatile long encCountL = 0;    // 왼쪽 펄스 (21번 핀)
+volatile long encCountR = 0;    // 오른쪽 펄스 (20번 핀)
+int target[2] = {0, 0};         // 좌/우 목표펄스 (0~TARGET_MAX, 펄스 모드용)
+int rawSpeed[2] = {0, 0};       // [0730-2] 필터 전 원시 펄스 (진단용)
+int useSpeed[2] = {0, 0};       // [0730-2] PID가 실제로 본 값 = 텔레메트리로 보내는 값
+unsigned long wheel_t = 0;
+
+
+// ================= ★[0904-4] 무입력 워치독 (통신 끊김 → 정지)★ =================
+// ★왜 되살렸나★ 0713 에 무입력 타임아웃을 제거한 뒤로 이 보드는 ★마지막 명령을
+//   영원히 물고 있었다★. 그 결과 상위(PC)가 어떤 이유로든 말을 멈추면 차가 그대로
+//   계속 간다:
+//     · 상위 노드가 SIGKILL 로 죽는다 (`ros2 run nxde kill`, OOM, 강제종료)
+//     · 런치를 띄운 터미널이 먼저 닫혀 노드가 고아가 된 뒤 죽는다
+//     · USB 케이블이 빠지거나 접촉이 끊긴다
+//     · PC 가 멎는다 (커널 패닉·전원)
+//   정상 종료 경로(Ctrl+C)에는 상위가 정지값을 써 넣는 처리(arduino.py stop_and_close)
+//   가 있지만, ★그 코드가 실행되지 않는 종료가 위의 넷★ 이다. 펌웨어가 스스로
+//   판단하는 것만이 그 넷을 모두 덮는다.
+//
+// ★3초의 근거★ 상위는 값이 안 바뀌어도 ★1초 주기로 같은 값을 재전송한다★
+//   (nxde/arduino.py KEEPALIVE_S = 1.0, A·B 양쪽). 값이 바뀌면 그보다 훨씬 촘촘히
+//   나간다(TX_PERIOD_S = 0.05 판정 주기 — 수동조종 중에는 사실상 20Hz).
+//   즉 정상 상태에서 줄 간격은 ★최대 1초★ 다. 3초는 그 keepalive 를 ★세 번 연속
+//   놓쳤을 때★ 발동한다 — USB 재열거나 한두 번의 전송 실패로는 안 걸리고, 진짜
+//   단절이면 3초 안에 반드시 걸린다.
+//   ⚠️ 상위의 KEEPALIVE_S 를 늘리려면 ★이 값도 함께 늘려야 한다★ (셋 배 이상 유지).
+//     그쪽만 늘리면 정상 주행 중에 워치독이 걸려 차가 끊긴다.
+//
+// ★무엇을 '입력' 으로 세나 — 완전한 줄 하나★ 값의 내용을 보지 않는다. 형식 오류
+//   줄도, 핸드셰이크('-')도 센다. 이 워치독이 판정하는 것은 '명령이 유효한가' 가
+//   아니라 ★PC→보드 방향이 살아 있는가★ 이고, 어떤 줄이든 도착했다면 그 답은 예다.
+//
+// ★[1016-A1] 이 보드에는 E-stop 이 없다★ — E-stop 때 구동을 끊는 것은 상위의 쓰로틀 0 명령이고,
+//   상위가 죽었을 때 차를 세우는 것은 이 워치독 하나다.
+const unsigned long RX_TIMEOUT_MS = 3000;
+
+unsigned long rx_t    = 0;       // 마지막으로 '완전한 줄'을 받은 시각
+bool          rx_lost = false;   // 지금 무입력 정지 상태인가
+
+// ================= 출력용 =================
+unsigned long tele_t = 0;
+const unsigned long TELE_MS = 50;
+
+
+// ================= ★[0904-3] 연결확인 핸드셰이크 ('-' → "YES")★ =================
+// 상위(nxde/arduino.py identify_port, nxde/check.py)가 ★PC→보드 방향이 실제로
+// 살아 있는지★ 확인하는 유일한 수단이다. 텔레메트리는 보드→PC 한 방향만 증명한다.
+//   '-' 한 줄  → "YES" 한 줄을 즉시 찍고, 이 시간 동안 평상시 텔레메트리를 멈춘다.
+//   멈추는 이유는 상위가 "YES" 를 'S,...' 에 섞이지 않은 채로 읽게 하기 위함이다.
+//   ★millis() 로만 센다 — delay() 를 쓰지 않는다★ 유예 중에도 제어주기와 E-stop
+//   판정은 평소대로 돈다. 멈추는 것은 출력 한 줄뿐이고, 끝나면 아무 상태도 남지 않는다.
+const unsigned long HANDSHAKE_HOLD_MS = 2000;
+bool          handshake_hold = false;   // 지금 유예 중인가
+unsigned long handshake_t    = 0;       // "YES" 를 찍은 시각
+
+
+// ================= 시리얼 입력 버퍼 =================
+char rxBuf[48];
+uint8_t rxLen = 0;
+
+
+// ================= ISR (21번=왼쪽 펄스, 20번=오른쪽 펄스) =================
+void encISR_L() { encCountL++; }
+void encISR_R() { encCountR++; }
+
+
+// ================= [0730-1] 쓰로틀 중앙값 필터 =================
+int readThrottleMedian() {
+  int s[THROTTLE_MEDIAN_N];
+  for (uint8_t i = 0; i < THROTTLE_MEDIAN_N; i++) {
+    int v = analogRead(THROTTLE_PIN);
+    uint8_t j = i;
+    while (j > 0 && s[j - 1] > v) {
+      s[j] = s[j - 1];
+      j--;
+    }
+    s[j] = v;
+  }
+  return s[THROTTLE_MEDIAN_N / 2];
+}
+
+
+// ================= [0730-2] 주행펄스 3점 중앙값 (정렬 없이 비교 3회) =================
+int median3(int a, int b, int c) {
+  int lo = min(a, b);
+  int hi = max(a, b);
+  return max(lo, min(hi, c));
+}
+
+void pushSpeed(uint8_t idx, int v) {
+  spdBuf[idx][spdPos[idx]] = v;
+  spdPos[idx] = (spdPos[idx] + 1) % SPEED_MEDIAN_N;
+}
+
+void fillSpeed(uint8_t idx, int v) {
+  for (uint8_t k = 0; k < SPEED_MEDIAN_N; k++) spdBuf[idx][k] = v;
+  spdPos[idx] = 0;
+}
+
+
+// ================= 인휠 FF 보간 (목표펄스 -> PWM, 3점 라그랑주 2차보간) =================
+float interpFF(float x) {
+  if (x <= 0) return 0.0;
+  if (x <= ffPulseTable[0]) {
+    return ffPwmTable[0] * (x / ffPulseTable[0]);
+  }
+  if (x >= ffPulseTable[FF_TABLE_N - 1]) {
+    return ffPwmTable[FF_TABLE_N - 1];
+  }
+
+  int i = 0;
+  while (i < FF_TABLE_N - 2 && x > ffPulseTable[i + 1]) i++;
+
+  int i0, i1, i2;
+  if (i == 0) { i0 = 0; i1 = 1; i2 = 2; }
+  else        { i0 = i - 1; i1 = i; i2 = i + 1; }
+
+  float x0 = ffPulseTable[i0], x1 = ffPulseTable[i1], x2 = ffPulseTable[i2];
+  float y0 = ffPwmTable[i0],   y1 = ffPwmTable[i1],   y2 = ffPwmTable[i2];
+
+  float L0 = (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2));
+  float L1 = (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2));
+  float L2 = (x - x0) * (x - x1) / ((x2 - x0) * (x2 - x1));
+
+  return y0 * L0 + y1 * L1 + y2 * L2;
+}
+
+
+// ================= [0730-2] 기동 블랭킹 진입/종료 =================
+void enterLaunch(uint8_t idx, unsigned long now) {
+  launching[idx] = true;
+  launch_t[idx] = now;
+  settleCnt[idx] = 0;
+  noiseCnt[idx] = 0;
+  pidI[idx] = 0;
+  pidLastErr[idx] = 0;
+  pidCoasting[idx] = false;   // 블랭킹 중엔 코스트/캐치 판정을 아예 하지 않는다
+  runawayCnt[idx] = 0;
+}
+
+void exitLaunch(uint8_t idx, int speed) {
+  launching[idx] = false;
+  settleCnt[idx] = 0;
+  noiseCnt[idx] = 0;
+  pidI[idx] = 0;
+  pidLastErr[idx] = target[idx] - speed;
+}
+
+// ================= [0730-2] 기동 블랭킹 중 개루프 출력 =================
+int launchPwm(uint8_t idx) {
+  int ffPwm = (int)interpFF((float)target[idx]);
+  if (ffPwm > PWM_MAX) ffPwm = PWM_MAX;
+
+  int pwm = pidLastPwm[idx] + PWM_SLEW_MAX;
+  if (pwm > ffPwm) pwm = ffPwm;
+  if (pwm < 0) pwm = 0;
+
+  pidLastPwm[idx] = pwm;
+  return pwm;
+}
+
+
+// ================= 인휠 PID (FF 보간 + PID + 코스트-캐치 + 폭주 감지) =================
+int updatePid(uint8_t idx, int tgt, int speed) {
+  int err = tgt - speed;
+  int d = err - pidLastErr[idx];
+  pidLastErr[idx] = err;
+
+  float ff = interpFF((float)tgt);
+
+  // 폭주 감지: 지속 과속이면 코스트 진입(PWM 0)
+  if (err <= -RUNAWAY_ERR_OVER) {
+    runawayCnt[idx]++;
+    if (runawayCnt[idx] >= RUNAWAY_CONFIRM_CYCLES) {
+      pidCoasting[idx] = true;
+      pidI[idx] = 0;
+      runawayCnt[idx] = 0;
+    }
+  } else {
+    runawayCnt[idx] = 0;
+  }
+
+  // 코스트-캐치: 목표+마진까지 내려오면 PID 재개
+  if (pidCoasting[idx] && speed <= tgt + CATCH_MARGIN) {
+    pidCoasting[idx] = false;
+  }
+
+  int pwm;
+  if (pidCoasting[idx]) {
+    pwm = 0;
+    pidI[idx] = 0;
+  } else {
+    float iTerm = ki[idx] * pidI[idx];
+    pwm = ff + kp[idx] * err + iTerm + kd[idx] * d;
+
+    // anti-windup: 출력 포화 시, 그리고 오차가 클 때(가속 중)는 적분 누적 중단
+    if (pwm > 0 && pwm < PWM_MAX && abs(err) < I_ACCUM_ERR_MAX) {
+      pidI[idx] += err;
+    }
+
+    // 적분 기여분을 ki 값과 무관하게 ±40 pwm로 고정 제한
+    iTerm = constrain(ki[idx] * pidI[idx], -40, 40);
+    pwm = ff + kp[idx] * err + iTerm + kd[idx] * d;
+    if (pwm > PWM_MAX) pwm = PWM_MAX;
+    if (pwm < 0) pwm = 0;
+  }
+
+  pwm = constrain(pwm, 0, PWM_MAX);
+
+  // 슬루레이트 제한: pwm 급상승만 제한(관성 오버슈트 방지), 하강은 즉시 반영
+  if (pwm > pidLastPwm[idx] + PWM_SLEW_MAX) pwm = pidLastPwm[idx] + PWM_SLEW_MAX;
+  pidLastPwm[idx] = pwm;
+
+  return pwm;
+}
+
+
+// ================= [0730-2] 한쪽 바퀴 갱신: 모드 분기 + 허수 필터 + 블랭킹/PID =================
+int updateWheelSide(uint8_t idx, int raw, unsigned long now) {
+  rawSpeed[idx] = raw;
+
+  // 직접 PWM 모드는 무보호 경로: 받은 값을 그대로 출력 (피드백을 아예 쓰지 않음)
+  if (driveMode[idx] == DRIVE_PWM) {
+    if (raw <= PULSE_SANITY_MAX) pushSpeed(idx, raw);
+    useSpeed[idx] = SPEED_MEDIAN_ON
+                      ? median3(spdBuf[idx][0], spdBuf[idx][1], spdBuf[idx][2])
+                      : raw;
+    return pwmDirect[idx];
+  }
+
+  // ── 허수 판정 : 물리적으로 불가능한 값은 중앙값 버퍼에 넣지 않는다 ──
+  bool sane = (raw <= PULSE_SANITY_MAX);
+  if (sane) {
+    pushSpeed(idx, raw);
+    noiseCnt[idx] = 0;
+    settleCnt[idx]++;
+  } else {
+    settleCnt[idx] = 0;
+    if (!launching[idx]) noiseCnt[idx]++;   // 블랭킹 중엔 노이즈가 정상이라 세지 않음
+  }
+
+  useSpeed[idx] = SPEED_MEDIAN_ON
+                    ? median3(spdBuf[idx][0], spdBuf[idx][1], spdBuf[idx][2])
+                    : (sane ? raw : useSpeed[idx]);
+  int speed = useSpeed[idx];
+
+  // ── 기동 블랭킹 : 피드백 무시하고 FF까지 개루프 램프 ──
+  if (launching[idx]) {
+    int pwm = launchPwm(idx);
+
+    int ffPwm = (int)interpFF((float)target[idx]);
+    if (ffPwm > PWM_MAX) ffPwm = PWM_MAX;
+    bool rampDone = (pwm >= ffPwm);
+    bool settled  = (settleCnt[idx] >= LAUNCH_SETTLE_CYCLES);
+    bool timeout  = (now - launch_t[idx] >= LAUNCH_MAX_MS);
+
+    if ((rampDone && settled) || timeout) {
+      exitLaunch(idx, speed);
+    }
+    return pwm;
+  }
+
+  // ── 센서 이상 실패안전 : 허수가 계속 들어오면 코스트로 내린다 ──
+  if (NOISE_HOLD_MAX_CYCLES > 0 && noiseCnt[idx] >= NOISE_HOLD_MAX_CYCLES) {
+    pidCoasting[idx] = true;
+    pidI[idx] = 0;
+    pidLastPwm[idx] = 0;
+    noiseCnt[idx] = 0;
+    return 0;
+  }
+
+  return updatePid(idx, target[idx], speed);
+}
+
+
+// ================= ★[0904-4] 구동 상태 전체 초기화 (공용)★ =================
+// 무입력 워치독이 쓴다(1016 전에는 applyEstop 도 썼다). ★복제하지 않는다★ — 초기화할
+// 항목이 열 가지가 넘어서(직접 PWM 해제·PID·슬루 기준점·블랭킹·노이즈 카운터),
+// 한쪽에만 항목을 추가하면 '해제 후 재개 시 잔재' 라는 같은 버그가 한쪽에서만
+// 되살아난다. ★PWM 출력을 끊는 것은 부르는 쪽의 책임이다★ (이 함수는 상태만 본다).
+void resetDriveState() {
+  // 양쪽 구동 상태 초기화 (직접 PWM 모드도 강제 해제, 해제 후 재개 시 잔재 방지)
+  for (uint8_t s = 0; s < 2; s++) {
+    target[s] = 0;
+    driveMode[s] = DRIVE_PULSE;
+    pwmDirect[s] = 0;
+    pidI[s] = 0;
+    pidLastErr[s] = 0;
+    pidCoasting[s] = false;
+    pidLastPwm[s] = 0;   // 슬루레이트 제한 기준점도 리셋 (해제 후 0부터 다시 램프업)
+    runawayCnt[s] = 0;
+    launching[s] = false;
+    settleCnt[s] = 0;
+    noiseCnt[s] = 0;
+    // ※ 중앙값 버퍼(spdBuf)는 일부러 건드리지 않는다. e-stop 중에는 계측이 멈추므로
+    //   0으로 채워버리면 '바퀴가 멈춤'으로 오인되어, 아직 관성으로 굴러가는 상태에서
+    //   해제 직후 블랭킹(개루프 가속)에 진입할 수 있다.
+  }
+  noInterrupts();
+  encCountL = 0;
+  encCountR = 0;
+  interrupts();
+  wheel_t = millis();
+}
+
+
+// ================= ★[0904-4] 무입력 워치독 (매 루프 호출)★ =================
+// pollSerial 바로 뒤에 불린다 — 이번 루프에 들어온 줄이 즉시 반영되도록.
+//
+// ★진입은 엣지에서 한 번만 처리한다★ 매 루프 초기화를 반복하면 관성으로 굴러가는
+//   동안 encCount 를 계속 지워, 중앙값 버퍼가 '멈춤'으로 채워진다. 그러면 복구 직후
+//   기동 블랭킹(개루프 가속)에 잘못 진입한다 — 옛 applyEstop(1016 에서 삭제)이 spdBuf 를
+//   일부러 건드리지 않던 것과 같은 이유다.
+//
+// ★진입 뒤에는 updateWheel 을 그대로 돌린다★ (E-stop 처럼 통째로 멈추지 않는다)
+//   근거가 둘이다:
+//     ① 안전하다 — resetDriveState 가 target 을 0 으로 놓고 직접 PWM 모드를 해제했다.
+//        target 0 에서 PID 경로는 반드시 PWM 0 을 낸다: interpFF(0) = 0 이고
+//        err = 0 - speed <= 0 이므로 합이 음수 → 0 으로 클램프된다. 코스트-캐치가
+//        풀려도(speed <= 1) 결과는 같다.
+//     ② ★계측이 계속 살아 있다★ 링크가 끊긴 원인을 사람이 찾는 국면이므로,
+//        텔레메트리("S,<좌>,<우>,<쓰로틀>")가 흐르는 편이 훨씬 낫다. E-stop 처럼
+//        멈추면 시리얼 모니터로 봐도 바퀴가 실제로 섰는지 알 수 없다.
+//
+// ★출력 형식은 바꾸지 않는다★ 무입력 상태를 알리는 줄을 따로 찍고 싶지만, 상위
+//   parse_a 는 "S,"·"YES" 만 알고 나머지는 잡음으로 세어 경고를 낸다.
+//   상태는 '펄스가 0 으로 떨어진다' 로 이미 관측된다.
+void updateRxWatchdog(unsigned long now) {
+  if (now - rx_t <= RX_TIMEOUT_MS) {
+    rx_lost = false;         // 정상 — 줄이 제때 오고 있다
+    return;
+  }
+  if (rx_lost) return;       // 이미 처리한 단절이다 (엣지에서 한 번만)
+
+  rx_lost = true;
+  analogWrite(PWM_PIN_L, 0);
+  analogWrite(PWM_PIN_R, 0);
+  resetDriveState();
+}
+
+
+// ================= ★[0904-3] 핸드셰이크 토큰★ ('-' 한 글자로만 이루어진 줄) =================
+// 구동 명령과 겹칠 여지가 없다 — 이 보드의 입력은 전부 ★부호 없는★ 정수라서
+// '-' 로 시작하는 줄은 어차피 isValidNumber 에서 걸러진다.
+bool isHandshakeToken(const char* s) {
+  return s && s[0] == '-' && s[1] == '\0';
+}
+
+
+// ================= 입력 형식 검사 (부호 없는 정수만) =================
+bool isValidNumber(const char* s) {
+  if (!s || *s == '\0') return false;
+  for (uint8_t k = 0; s[k] != '\0'; k++) {
+    if (!isdigit((unsigned char)s[k])) return false;
+  }
+  return true;
+}
+
+
+// ================= setup =================
+void setup() {
+  Serial.begin(BAUD);
+
+  pinMode(HALL_PIN_L, INPUT_PULLUP);
+  pinMode(HALL_PIN_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN_L), encISR_L, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN_R), encISR_R, CHANGE);
+
+  pinMode(PWM_PIN_L, OUTPUT);
+  pinMode(PWM_PIN_R, OUTPUT);
+  analogWrite(PWM_PIN_L, 0);
+  analogWrite(PWM_PIN_R, 0);
+
+  // [0730-1] 쓰로틀 페달 (analogRead는 pinMode 없어도 되지만 명시)
+  pinMode(THROTTLE_PIN, INPUT);
+  throttleRaw = readThrottleMedian();   // 첫 텔레메트리부터 실제값이 나가도록 프라이밍
+
+  // [0730-2] 부팅 시엔 바퀴가 멈춰 있으므로 중앙값 버퍼를 0으로 채워둔다
+  fillSpeed(LEFT, 0);
+  fillSpeed(RIGHT, 0);
+
+  unsigned long now = millis();
+  wheel_t = tele_t = now;
+
+  // ★[0904-4] 워치독 프라이밍★ 부팅 직후를 '무입력' 으로 세지 않는다.
+  //   상위가 붙기까지 몇 초가 걸리는 것은 정상이고, 그 동안 target 은 이미 0 이라
+  //   워치독이 걸려도 하는 일이 없다. 그래도 여기서 세워 두는 이유는 ★rx_lost 가
+  //   부팅부터 true 로 서 있으면 첫 줄이 올 때까지 상태가 '단절' 로 보여★, 나중에
+  //   이 플래그를 텔레메트리나 진단에 쓰려 할 때 뜻이 어긋나기 때문이다.
+  rx_t = now;
+  rx_lost = false;
+}
+
+
+// ================= 값 파싱 =================
+long parseValue(const char* s) {
+  if (!isValidNumber(s)) return -1;
+  if (strlen(s) > 3) return 256;
+  return atoi(s);
+}
+
+
+// ================= 펄스 모드 목표 적용 =================
+void setPulseTarget(uint8_t idx, int newTarget, unsigned long now) {
+  if (driveMode[idx] == DRIVE_PWM) {
+    driveMode[idx] = DRIVE_PULSE;
+    pwmDirect[idx] = 0;
+    pidI[idx] = 0;
+    pidLastErr[idx] = 0;
+    pidLastPwm[idx] = 0;      // 슬루 기준점 리셋: 캐치 후 0부터 다시 램프업
+    runawayCnt[idx] = 0;
+    noiseCnt[idx] = 0;
+    target[idx] = newTarget;
+
+    if (newTarget > 0 && useSpeed[idx] <= LAUNCH_ENTRY_SPEED_MAX) {
+      enterLaunch(idx, now);
+    } else {
+      launching[idx] = false;
+      pidCoasting[idx] = true;
+    }
+    return;
+  }
+
+  // ★ [0730-2] 기동 블랭킹 진입 판정 : 멈춘 상태(0)에서 처음 양수 목표를 받을 때만 ★
+  if (target[idx] == 0 && newTarget > 0 && useSpeed[idx] <= LAUNCH_ENTRY_SPEED_MAX) {
+    target[idx] = newTarget;
+    enterLaunch(idx, now);
+    return;
+  }
+
+  // 목표 하강 → 코스트 진입(무동력 감속), 상승 → 코스트 해제 (좌우 개별)
+  if (newTarget < target[idx]) {
+    pidCoasting[idx] = true;
+    pidI[idx] = 0;
+    if (newTarget == 0) launching[idx] = false;   // 정지 명령은 블랭킹보다 우선
+  } else if (newTarget > target[idx]) {
+    pidCoasting[idx] = false;
+  }
+  target[idx] = newTarget;
+}
+
+
+// ================= 값 -> 한쪽 바퀴 적용 (콤마 2값 형식 전용) =================
+void applySide(uint8_t idx, long v, unsigned long now) {
+  if (v <= TARGET_MAX) {
+    setPulseTarget(idx, (int)v, now);
+  } else if (v <= PWM_DIRECT_MAX) {
+    driveMode[idx] = DRIVE_PWM;
+    pwmDirect[idx] = (int)v;
+    launching[idx] = false;   // 직접 PWM은 무보호 경로 — 블랭킹도 적용하지 않는다
+  } else {
+    setPulseTarget(idx, 0, now);
+  }
+}
+
+
+// ================= 입력 파서 =================
+void handleLine(char* line, unsigned long now) {
+  // ★[0904-3] "-" 한 줄 = 연결확인 핸드셰이크★ 구동에는 아무 영향이 없다.
+  if (isHandshakeToken(line)) {
+    Serial.println("YES");
+    handshake_hold = true;
+    handshake_t = now;
+    return;
+  }
+
+  if (strchr(line, ' ')) return;   // 공백 포함 줄은 형식 오류 (기존과 동일하게 무시)
+
+  char* comma = strchr(line, ',');
+  if (comma) {
+    *comma = '\0';
+    char* tokR = comma + 1;
+    if (strchr(tokR, ',')) return;   // 콤마 2개 이상 → 무시
+
+    long vL = parseValue(line);
+    long vR = parseValue(tokR);
+    if (vL < 0 || vR < 0) return;
+
+    applySide(LEFT, vL, now);
+    applySide(RIGHT, vR, now);
+  } else {
+    // 단일 값은 무조건 펄스 모드: 0~15만 받고 그 외는 무시
+    long v = parseValue(line);
+    if (v < 0 || v > TARGET_MAX) return;
+
+    setPulseTarget(LEFT, (int)v, now);
+    setPulseTarget(RIGHT, (int)v, now);
+  }
+}
+
+void pollSerial(unsigned long now) {
+  while (Serial.available() > 0) {
+    char ch = (char)Serial.read();
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      rxBuf[rxLen] = '\0';
+      if (rxLen > 0) {
+        // ★[0904-4] 워치독 리셋은 handleLine 앞에 둔다★ handleLine 은 형식 오류
+        //   줄을 return 으로 버리는데, 그 줄도 '링크가 살아 있다'는
+        //   증거로는 유효하다. 뒤에 두면 형식 오류가 이어질 때 워치독이 오발동한다.
+        rx_t = now;
+        handleLine(rxBuf, now);
+      }
+      rxLen = 0;
+    } else if (rxLen < sizeof(rxBuf) - 1) {
+      rxBuf[rxLen++] = ch;
+    } else {
+      rxLen = 0;
+    }
+  }
+}
+
+
+// ================= 인휠 제어 (좌우 독립: 펄스 PID 또는 직접 PWM) =================
+void updateWheel(unsigned long now) {
+  if (now - wheel_t < CONTROL_WINDOW_MS) return;
+  wheel_t += CONTROL_WINDOW_MS;
+
+  noInterrupts();
+  long cL = encCountL;
+  long cR = encCountR;
+  encCountL = 0;
+  encCountR = 0;
+  interrupts();
+
+  // [0730-1] 쓰로틀 페달 계측 (제어에는 쓰지 않고 텔레메트리로만 보고)
+  throttleRaw = readThrottleMedian();
+
+  int pwmL = updateWheelSide(LEFT,  (int)cL, now);   // 왼쪽 : 펄스 21 -> PWM 8
+  int pwmR = updateWheelSide(RIGHT, (int)cR, now);   // 오른쪽 : 펄스 20 -> PWM 10
+
+  analogWrite(PWM_PIN_L, pwmL);
+  analogWrite(PWM_PIN_R, pwmR);
+}
+
+
+// ================= 출력 =================
+// "S,<왼쪽펄스>,<오른쪽펄스>,<쓰로틀raw>" — ★[1016-A1] "STOP" 은 없다★
+// ★[0904-3] 핸드셰이크 유예 중에는 평상시 줄을 내보내지 않는다★
+void sendOutput(unsigned long now) {
+  if (now - tele_t < TELE_MS) return;
+  tele_t = now;
+
+  if (handshake_hold) {
+    if (now - handshake_t < HANDSHAKE_HOLD_MS) return;
+    handshake_hold = false;      // 유예 종료 — 다음 줄부터 원래대로
+  }
+
+  Serial.print("S,");
+  Serial.print(useSpeed[LEFT]);
+  Serial.print(',');
+  Serial.print(useSpeed[RIGHT]);
+  Serial.print(',');
+  Serial.println(throttleRaw);
+}
+
+
+// ================= loop =================
+void loop() {
+  unsigned long now = millis();
+
+  pollSerial(now);
+
+  // ★[0904-4] 무입력 워치독★ pollSerial 뒤 — 이번 루프에 들어온 줄을 먼저 센다.
+  updateRxWatchdog(now);
+
+  updateWheel(now);
+
+  sendOutput(now);
+}
