@@ -25,6 +25,11 @@
 //    ▶ A5 는 이제 아무것도 읽지 않는다(pinMode 도 안 건다). 선이 남아 있어도 무해하다.
 //    ▶ ⚠️ 디바운스는 없다(1016·1017 의 A5 와 같다) — 접점 떨림은 제동등 깜박임 · 인휠 차단 순간 토막으로 나타난다.
 //
+//  ★★ [1020-2] E-stop D12 → ★D18★ (2026-10-20 실차 — E-stop 이 D18 에 물려 있는데 코드가 D12 를 읽어 반응이 없었다) ★★
+//    ▶ 판정·확인시간(100ms)·NC 꼴(통전 LOW = 평상, 끊김 HIGH = E-stop)은 그대로, 핀만 바뀌었다.
+//    ▶ D18 은 Mega 의 TX1(Serial1)·INT3 이지만 둘 다 쓰지 않는다(Serial1.begin·attachInterrupt 없음) — 보통 디지털 입력.
+//    ▶ D12 는 이제 아무것도 읽지 않는다.
+//
 // ════════════════════════════════════════════════════════════════════════════
 //  ★★ [1017-1] 핀 — A보드 핀은 그대로, B보드 핀만 옮겼다 (사용자 지시 2026-10-17) ★★
 // ════════════════════════════════════════════════════════════════════════════
@@ -39,7 +44,7 @@
 //      조향 DC DIR                    ★D46★  B     digitalWrite 만 (1016_B : D7)
 //      리니어 PWM                     ★D45★  B     Timer5 (OC5B) (1016_B : D8 ← 인휠 왼쪽과 겹쳤다)
 //      리니어 DIR                     ★D47★  B     digitalWrite 만 (1016_B : D9)
-//      E-stop (NC)                    D12    B     입력
+//      E-stop (NC)                   ★D18★   B     입력 — ★[1020-2]★ (1017 : D12)
 //      주행모드 스위치                  D5     B     입력
 //      제동등 출력                     D11    B     digitalWrite 만
 //      제동등 스위치                   ★D53★   B     입력 (INPUT_PULLUP) — ★[1020-1]★ (1017 : A5)
@@ -148,8 +153,8 @@ const uint8_t LINEAR_DIR_PIN = 47;  // ★[1017-1]★ 1016_B : 9
 const uint8_t LINEAR_PWM_PIN = 45;  // ★[1017-1]★ 1016_B : 8
 
 // --- B : E-stop ---
-const uint8_t ESTOP_PIN = 12;
-// ★차량의 소프트웨어 E-stop 을 판정하는 곳은 여기 하나다★ 여기까지 false 로 두면 D12 라인을 보는 곳이
+const uint8_t ESTOP_PIN = 18;        // ★[1020-2]★ 1017 까지는 D12
+// ★차량의 소프트웨어 E-stop 을 판정하는 곳은 여기 하나다★ 여기까지 false 로 두면 E-stop 라인(D18)을 보는 곳이
 //   하나도 남지 않는다.
 const bool ESTOP_ENABLED = true;     // false 로 두면 핀 e-stop 비활성
 
@@ -163,7 +168,7 @@ const uint8_t MODE_PIN = 5;          // 주행모드 스위치 (D5 ── 스위
 
 // ★[1016-B] 제동등★ — 켜짐 = 스위치 밟힘 또는 1·2단 지령
 //   ★[1020-1]★ 배선 D53 ── 스위치(페달) ── GND, INPUT_PULLUP — 1017 까지는 A5
-//   ★통전(LOW) = 평상, 끊김(HIGH) = 밟힘★ (D12 E-stop 과 같은 NC 꼴 — 선이 빠지면 밟힘으로 본다)
+//   ★통전(LOW) = 평상, 끊김(HIGH) = 밟힘★ (D18 E-stop 과 같은 NC 꼴 — 선이 빠지면 밟힘으로 본다)
 const uint8_t BRAKE_SW_PIN   = 53;   // ★[1020-1]★ 제동등 스위치
 const uint8_t BRAKE_SW_PRESSED = HIGH;   // ★[1020-1]★ 이 레벨이면 밟힘 (1017 의 A5 는 LOW 였다)
 const uint8_t BRAKELIGHT_PIN = 11;   // 제동등 출력 (모터드라이버 PWM 선, digitalWrite 만)
@@ -397,7 +402,7 @@ unsigned long lin_ms2 = 0;        // 둘째 구간 시간 (0 = 없음)
 // ================= E-stop ([0904-1] 확인시간 100ms, 발동·해제 대칭) =================
 // 발동 : 100ms 연속 개방(HIGH) / 해제 : 100ms 연속 단락(LOW).
 //   ★[1007-1] 둘로 갈랐다★
-//     estop_line   : D12 확인 결과. 모드와 무관하게 updateEstop 이 늘 갱신한다.
+//     estop_line   : E-stop 라인(D18, [1020-2]) 확인 결과. 모드와 무관하게 updateEstop 이 늘 갱신한다.
 //     estop_active : ★효력★ = estopEffective() — loop 가 매 루프 다시 계산한다.
 bool estop_line   = false;
 bool estop_active = false;
@@ -1078,7 +1083,7 @@ void updateBrakeLight() {
 
 
 // ================= E-stop =================
-// ★[1007-1] 이 함수는 D12 라인만 판정한다(estop_line)★ 모드는 보지 않는다.
+// ★[1007-1] 이 함수는 E-stop 라인(D18, [1020-2])만 판정한다(estop_line)★ 모드는 보지 않는다.
 void updateEstop(unsigned long now) {
   if (!ESTOP_ENABLED) {
     estop_line   = false;
@@ -1537,7 +1542,7 @@ void loop() {
   updateLinear(now);
 
   // ★E-stop 판정은 pollSerial 보다 앞★ 발동 직후 들어온 줄이 한 번 먹는 틈을 없앤다
-  updateEstop(now);          // [1007-1] D12 라인(estop_line) — 모드와 무관
+  updateEstop(now);          // [1007-1] E-stop 라인(D18)(estop_line) — 모드와 무관
 
   // ★[1007-1] 주행모드도 pollSerial 보다 앞★ — 자율→수동으로 확정되면 여기서 리니어 0단 복귀
   updateMode(now);
