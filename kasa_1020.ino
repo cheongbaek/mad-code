@@ -16,8 +16,10 @@
 // ════════════════════════════════════════════════════════════════════════════
 //  ★★ [1020-1] 제동등 스위치 A5 → ★D53★ (사용자 지시 2026-10-20) — kasa_1017 과 다른 것은 이것 하나 ★★
 // ════════════════════════════════════════════════════════════════════════════
-//    ▶ 배선 D53 ── 스위치(페달) ── GND, INPUT_PULLUP. ★D53 이 GND 와 통전(LOW) = 밟힘★
-//    ▶ 제동등(D11) 켜짐 = ★D53 밟힘 OR 리니어 1·2단 지령★ — 판정식·차단([1017-4])·상태 칸([1016-C])은 그대로,
+//    ▶ 배선 D53 ── 스위치(페달) ── GND, INPUT_PULLUP.
+//      ★[2026-10-20 반전] D53 이 GND 와 통전(LOW) = 평상 · 끊김(HIGH) = 밟힘★ (1017 의 A5 와 반대 — NC 접점 꼴)
+//      → ★D53 선이 빠지거나 끊겨도 '밟힘' 이다★ — 제동등이 켜지고 상태 1 이라 인휠이 끊긴다(차가 안 나간다).
+//    ▶ 제동등(D11) 켜짐 = ★D53 밟힘(HIGH) OR 리니어 1·2단 지령★ — 판정식·차단([1017-4])·상태 칸([1016-C])은 그대로,
 //      입력 핀만 바뀌었다. 그래서 D53 이 밟히면 상태 1 → 보드가 인휠을 끊는다(1017 의 A5 와 같다).
 //    ▶ D53 은 Mega 의 SPI SS 핀이지만 SPI 를 쓰지 않으므로(라이브러리 없음) 보통 디지털 입력이다.
 //    ▶ A5 는 이제 아무것도 읽지 않는다(pinMode 도 안 건다). 선이 남아 있어도 무해하다.
@@ -159,9 +161,11 @@ const bool E_STOP_TEST = true;
 
 const uint8_t MODE_PIN = 5;          // 주행모드 스위치 (D5 ── 스위치 ── GND)
 
-// ★[1016-B] 제동등★ — 켜짐 = 스위치 닫힘(LOW) 또는 1·2단 지령
-//   ★[1020-1]★ 배선 D53 ── 스위치(페달) ── GND, INPUT_PULLUP (D5·D12 와 같은 꼴) — 1017 까지는 A5
-const uint8_t BRAKE_SW_PIN   = 53;   // ★[1020-1]★ 제동등 스위치 (LOW = GND 통전 = 밟힘 = 켬)
+// ★[1016-B] 제동등★ — 켜짐 = 스위치 밟힘 또는 1·2단 지령
+//   ★[1020-1]★ 배선 D53 ── 스위치(페달) ── GND, INPUT_PULLUP — 1017 까지는 A5
+//   ★통전(LOW) = 평상, 끊김(HIGH) = 밟힘★ (D12 E-stop 과 같은 NC 꼴 — 선이 빠지면 밟힘으로 본다)
+const uint8_t BRAKE_SW_PIN   = 53;   // ★[1020-1]★ 제동등 스위치
+const uint8_t BRAKE_SW_PRESSED = HIGH;   // ★[1020-1]★ 이 레벨이면 밟힘 (1017 의 A5 는 LOW 였다)
 const uint8_t BRAKELIGHT_PIN = 11;   // 제동등 출력 (모터드라이버 PWM 선, digitalWrite 만)
 
 // ★[1017-4] 상태 2·1 이면 보드가 스스로 인휠을 끊는다★ false = 1016 처럼 상위의 0 명령에만 기댄다
@@ -1063,10 +1067,10 @@ void updateBrake(unsigned long now) {
   if (brake_cmd_level != brake_level) startLinMove(brake_cmd_level, now);
 }
 
-// ★[1016-B] 제동등 : D53 스위치 닫힘(LOW) 또는 1·2단 지령★ ([1020-1] 1017 까지는 A5) — 어떤 분기에도 걸지 않고 매 루프 부른다.
+// ★[1016-B] 제동등 : D53 밟힘(HIGH = GND 와 끊김) 또는 1·2단 지령★ ([1020-1] 1017 까지는 A5) — 어떤 분기에도 걸지 않고 매 루프 부른다.
 bool brakelight_on = false;   // [1016-C] 텔레메트리 상태 1 의 출처 · ★[1017-4] 구동 차단의 출처★
 void updateBrakeLight() {
-  bool on = (digitalRead(BRAKE_SW_PIN) == LOW)
+  bool on = (digitalRead(BRAKE_SW_PIN) == BRAKE_SW_PRESSED)
          || brake_cmd_level == BRAKE_SOFT || brake_cmd_level == BRAKE_FULL;
   brakelight_on = on;
   digitalWrite(BRAKELIGHT_PIN, on ? HIGH : LOW);
@@ -1474,7 +1478,7 @@ void setup() {
 
   pinMode(MODE_PIN, INPUT_PULLUP);
 
-  // ★[1016-B] 제동등★ D53([1020-1]) 은 스위치 입력(내부 풀업 — 스위치가 GND 로 당긴다), D11 은 출력
+  // ★[1016-B] 제동등★ D53([1020-1]) 은 스위치 입력(내부 풀업 — 평상시 스위치가 GND 로 당기고, 밟으면 끊겨 HIGH), D11 은 출력
   pinMode(BRAKE_SW_PIN, INPUT_PULLUP);
   pinMode(BRAKELIGHT_PIN, OUTPUT);
   digitalWrite(BRAKELIGHT_PIN, LOW);
